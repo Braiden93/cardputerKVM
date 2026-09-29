@@ -45,9 +45,12 @@ static void on_espnow_sent(const uint8_t *mac_addr, esp_now_send_status_t status
 static void send_raw_packet(const void *data, size_t len)
 {
     esp_err_t result = esp_now_send(broadcast_mac, (const uint8_t*)data, len);
-    if (result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to send ESP-NOW packet: %s", esp_err_to_name(result));
+    if (result == ESP_ERR_ESPNOW_NO_MEM) {
+        // Queue full: yield 1 tick and retry once
+        vTaskDelay(pdMS_TO_TICKS(1));
+        esp_now_send(broadcast_mac, (const uint8_t*)data, len);
     }
+    // Do NOT log to UART0 on drop — UART0 is the active binary data channel!
 }
 
 static void send_key_report(uint8_t modifiers, uint8_t keycode)
@@ -188,12 +191,13 @@ static void heartbeat_task(void *pvParameters)
 }
 
 #define UART_PORT UART_NUM_0
-#define UART_BUF_SIZE 512
+#define UART_BUF_SIZE 2048
+#define UART_BAUD_RATE 921600
 
 static void init_uart()
 {
     uart_config_t uart_config = {
-        .baud_rate = 115200,
+        .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -202,18 +206,19 @@ static void init_uart()
     };
     uart_driver_install(UART_PORT, UART_BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(UART_PORT, &uart_config);
+    uart_set_rx_timeout(UART_PORT, 2);
 }
 
 // High-speed Serial Bridge: PC Client (Serial) -> ESP-NOW -> Cardputer Receiver
 static void serial_bridge_task(void *pvParameters)
 {
-    uint8_t rx_buf[256];
+    uint8_t rx_buf[1024];
     size_t rx_len = 0;
 
-    ESP_LOGI(TAG, "Serial KVM Bridge active on UART0 (115200 baud)");
+    ESP_LOGI(TAG, "Serial KVM Bridge active on UART0 (%d baud)", UART_BAUD_RATE);
 
     while (1) {
-        int len = uart_read_bytes(UART_PORT, rx_buf + rx_len, sizeof(rx_buf) - rx_len, pdMS_TO_TICKS(10));
+        int len = uart_read_bytes(UART_PORT, rx_buf + rx_len, sizeof(rx_buf) - rx_len, pdMS_TO_TICKS(1));
         if (len > 0) {
             rx_len += len;
 
@@ -231,7 +236,7 @@ static void serial_bridge_task(void *pvParameters)
                     } else if (pkt_type == KVM_PKT_HEARTBEAT) {
                         pkt_size = sizeof(kvm_heartbeat_packet_t);
                     } else {
-                        // Unknown packet type, discard 1 byte to realign
+                        // Unknown packet type under valid magic, advance 1 byte to realign
                         rx_len--;
                         memmove(rx_buf, rx_buf + 1, rx_len);
                         continue;
@@ -250,14 +255,17 @@ static void serial_bridge_task(void *pvParameters)
                         memmove(rx_buf, rx_buf + pkt_size, rx_len);
                     }
                 } else {
-                    // Raw ASCII typing fallback (e.g. typing in terminal)
-                    char c = (char)rx_buf[0];
-                    if (c > 0) {
-                        send_ascii_char(c);
+                    // Resynchronize: quickly scan for next KVM_ESPNOW_MAGIC (zero delay!)
+                    size_t drop = 1;
+                    while (drop + 1 < rx_len) {
+                        if (*(uint16_t*)(rx_buf + drop) == KVM_ESPNOW_MAGIC) {
+                            break;
+                        }
+                        drop++;
                     }
-                    rx_len--;
+                    rx_len -= drop;
                     if (rx_len > 0) {
-                        memmove(rx_buf, rx_buf + 1, rx_len);
+                        memmove(rx_buf, rx_buf + drop, rx_len);
                     }
                 }
             }
@@ -300,8 +308,9 @@ static void init_espnow_transmitter()
     peer_info.ifidx = WIFI_IF_STA;
     peer_info.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
 
-    ESP_LOGI(TAG, "ESP-NOW Transmitter ready on Channel %d (Broadcast: FF:FF:FF:FF:FF:FF)", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "ESP-NOW Transmitter ready on Channel %d (Broadcast: FF:FF:FF:FF:FF:FF, 24M PHY)", KVM_ESPNOW_CHANNEL);
 }
 
 void app_main(void)

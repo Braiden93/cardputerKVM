@@ -140,6 +140,14 @@ func DiscoverDevices() ([]*Device, error) {
 			continue
 		}
 
+		// CRITICAL: Filter out Cardputer's own spoofed USB HID interface (Dell KB216 / 413c:2113)
+		// to prevent catastrophic recursive input loopback when receiver is plugged into the same machine!
+		if strings.Contains(strings.ToLower(block), "413c") ||
+			strings.Contains(nameLower, "kb216") ||
+			strings.Contains(nameLower, "cardputer") {
+			continue
+		}
+
 		handlersMatch := handlersRe.FindStringSubmatch(block)
 		if len(handlersMatch) < 2 {
 			continue
@@ -168,7 +176,7 @@ func DiscoverDevices() ([]*Device, error) {
 
 		devPath := "/dev/input/" + eventNode
 
-		isMouse := hasMouseHandler || strings.Contains(nameLower, "mouse") || strings.Contains(nameLower, "touchpad")
+		isMouse := hasMouseHandler || (strings.Contains(nameLower, "touchpad") || (strings.Contains(nameLower, "mouse") && !strings.Contains(nameLower, "keyboard")))
 		isKeyboard := hasKbdHandler || strings.Contains(nameLower, "keyboard")
 
 		if !isMouse && !isKeyboard {
@@ -514,20 +522,10 @@ func (g *Grabber) handleRelEvent(evt InputEvent) {
 // handleSynEvent is called on kernel EV_SYN; dispatches movement immediately with zero accumulator windup
 func (g *Grabber) handleSynEvent() {
 	g.mouseMu.Lock()
-	defer g.mouseMu.Unlock()
-
 	if g.mouseDX == 0 && g.mouseDY == 0 && g.mouseWheel == 0 {
+		g.mouseMu.Unlock()
 		return
 	}
-
-	dx := clampInt8(g.mouseDX)
-	dy := clampInt8(g.mouseDY)
-	wheel := clampInt8(g.mouseWheel)
-
-	// ALWAYS reset to 0! Never leave residual windup across frames!
-	g.mouseDX = 0
-	g.mouseDY = 0
-	g.mouseWheel = 0
 
 	g.mu.RLock()
 	buttons := g.activeMouseButtons
@@ -535,11 +533,39 @@ func (g *Grabber) handleSynEvent() {
 	g.mu.RUnlock()
 
 	if !isGrabbed {
+		g.mouseDX = 0
+		g.mouseDY = 0
+		g.mouseWheel = 0
+		g.mouseMu.Unlock()
 		return
 	}
 
-	_ = g.trans.SendMouse(buttons, dx, dy, wheel)
-	g.emitMouseEvent(dx, dy, wheel)
+	var reports [8][3]int8
+	var count int
+
+	for iter := 0; (g.mouseDX != 0 || g.mouseDY != 0 || g.mouseWheel != 0) && iter < 8; iter++ {
+		dx := clampInt8(g.mouseDX)
+		dy := clampInt8(g.mouseDY)
+		wheel := clampInt8(g.mouseWheel)
+
+		g.mouseDX -= int32(dx)
+		g.mouseDY -= int32(dy)
+		g.mouseWheel -= int32(wheel)
+
+		reports[count] = [3]int8{dx, dy, wheel}
+		count++
+	}
+
+	// Reset any remainder to guarantee zero drift or float
+	g.mouseDX = 0
+	g.mouseDY = 0
+	g.mouseWheel = 0
+	g.mouseMu.Unlock()
+
+	for i := 0; i < count; i++ {
+		_ = g.trans.SendMouse(buttons, reports[i][0], reports[i][1], reports[i][2])
+		g.emitMouseEvent(reports[i][0], reports[i][1], reports[i][2])
+	}
 }
 
 // emitMouseEvent dispatches mouse motion telemetry to the UI callback (rate-limited to 25Hz to prevent TUI stutter)

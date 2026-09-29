@@ -20,7 +20,7 @@ import (
 func main() {
 	// Flags
 	serialPort := flag.String("serial", "", "Serial port for ESP32-S3 transmitter dongle (e.g. /dev/ttyUSB0, auto-detected if empty)")
-	baudRate := flag.Int("baud", 115200, "Serial baud rate")
+	baudRate := flag.Int("baud", 921600, "Serial baud rate (default 921600 for 1000Hz polling)")
 	startGrabbed := flag.Bool("grab", false, "Start immediately in hardware grab mode (locks physical input to target PC)")
 
 	injectText := flag.String("text", "", "CLI one-shot: inject text string to target PC without TUI")

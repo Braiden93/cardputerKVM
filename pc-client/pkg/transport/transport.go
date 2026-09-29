@@ -168,12 +168,22 @@ func (s *SerialTransport) SendRelease() error {
 
 func (s *SerialTransport) SendMouse(buttons byte, dx, dy, wheel int8) error {
 	s.mu.Lock()
-	s.seq++
-	seq := s.seq
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
-	pkt := protocol.EncodeMousePacket(buttons, dx, dy, wheel, seq)
-	return s.Send(pkt)
+	if s.port == nil || !s.connected {
+		return fmt.Errorf("serial port %s not connected", s.portName)
+	}
+
+	s.seq++
+	pkt := protocol.EncodeMousePacket(buttons, dx, dy, wheel, s.seq)
+	n, err := s.port.Write(pkt)
+	if err != nil {
+		s.stats.Errors++
+		return err
+	}
+	s.stats.PacketsSent++
+	s.stats.BytesSent += uint64(n)
+	return nil
 }
 
 func (s *SerialTransport) SendHeartbeat() error {

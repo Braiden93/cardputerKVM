@@ -91,15 +91,38 @@ typedef struct {
 
 static QueueHandle_t s_kvm_queue = NULL;
 
+typedef struct {
+    int32_t dx;
+    int32_t dy;
+    int32_t wheel;
+    uint8_t buttons;
+    bool    dirty;
+    portMUX_TYPE mux;
+} kvm_mouse_state_t;
+
+static kvm_mouse_state_t s_mouse_state = {
+    .dx = 0,
+    .dy = 0,
+    .wheel = 0,
+    .buttons = 0,
+    .dirty = false,
+    .mux = portMUX_INITIALIZER_UNLOCKED
+};
+
 static void kvm_dispatcher_task(void *pvParameters)
 {
-    kvm_event_t evt;
-    ESP_LOGI(TAG, "High-Priority KVM USB Dispatcher Task started.");
+    ESP_LOGI(TAG, "Phase-Locked 1000Hz KVM USB Dispatcher Task started.");
+    uint8_t last_sent_buttons = 0;
 
     while (1) {
-        if (xQueueReceive(s_kvm_queue, &evt, portMAX_DELAY)) {
-            if (!tusb_hid_device_helper_is_mounted()) continue;
+        if (!tusb_hid_device_helper_is_mounted()) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
 
+        // 1. Process discrete keyboard events first
+        kvm_event_t evt;
+        if (s_kvm_queue && xQueueReceive(s_kvm_queue, &evt, 0) == pdTRUE) {
             if (evt.pkt_type == KVM_PKT_KEY_REPORT) {
                 bool has_key = false;
                 for (int i = 0; i < 6; i++) {
@@ -114,11 +137,55 @@ static void kvm_dispatcher_task(void *pvParameters)
                 last_key_code = evt.keycodes[0];
                 last_key_name = has_key ? "Remote Key" : "Released";
                 key_count++;
-            } else if (evt.pkt_type == KVM_PKT_MOUSE_MOVE) {
-                tusb_hid_device_helper_mouse_report(evt.buttons, evt.dx, evt.dy, evt.wheel);
-                last_key_name = "Mouse";
-                key_count++;
             }
+        }
+
+        // 2. Dispatch accumulated mouse displacement phase-locked to USB frame readiness
+        portENTER_CRITICAL(&s_mouse_state.mux);
+        bool has_motion = s_mouse_state.dirty;
+        portEXIT_CRITICAL(&s_mouse_state.mux);
+
+        if (has_motion) {
+            if (tusb_hid_device_helper_ready()) {
+                portENTER_CRITICAL(&s_mouse_state.mux);
+                int32_t m_dx = s_mouse_state.dx;
+                int32_t m_dy = s_mouse_state.dy;
+                int32_t m_wheel = s_mouse_state.wheel;
+                uint8_t m_buttons = s_mouse_state.buttons;
+
+                bool buttons_changed = (m_buttons != last_sent_buttons);
+
+                if (m_dx != 0 || m_dy != 0 || m_wheel != 0 || buttons_changed) {
+                    int8_t send_dx = (m_dx > 127) ? 127 : ((m_dx < -127) ? -127 : (int8_t)m_dx);
+                    int8_t send_dy = (m_dy > 127) ? 127 : ((m_dy < -127) ? -127 : (int8_t)m_dy);
+                    int8_t send_wheel = (m_wheel > 127) ? 127 : ((m_wheel < -127) ? -127 : (int8_t)m_wheel);
+
+                    s_mouse_state.dx -= send_dx;
+                    s_mouse_state.dy -= send_dy;
+                    s_mouse_state.wheel -= send_wheel;
+                    s_mouse_state.dirty = (s_mouse_state.dx != 0 || s_mouse_state.dy != 0 || s_mouse_state.wheel != 0);
+                    last_sent_buttons = m_buttons;
+                    portEXIT_CRITICAL(&s_mouse_state.mux);
+
+                    tusb_hid_device_helper_mouse_report_nowait(m_buttons, send_dx, send_dy, send_wheel);
+                    last_key_name = "Mouse";
+                    key_count++;
+
+                    // Sent 1 frame: USB endpoint is now busy for 1ms SOF
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                } else {
+                    s_mouse_state.dirty = false;
+                    portEXIT_CRITICAL(&s_mouse_state.mux);
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+            } else {
+                // USB endpoint busy transmitting previous 1ms frame:
+                // Micro-sleep to phase-lock with host SOF completion without burning CPU
+                esp_rom_delay_us(100);
+            }
+        } else {
+            // Idle: sleep 1 tick (1ms)
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 }
@@ -147,16 +214,13 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
     }
     else if (pkt_type == KVM_PKT_MOUSE_MOVE && len >= sizeof(kvm_mouse_packet_t)) {
         const kvm_mouse_packet_t *pkt = (const kvm_mouse_packet_t*)data;
-        kvm_event_t evt = {};
-        evt.pkt_type = pkt_type;
-        evt.buttons = pkt->buttons;
-        evt.dx = pkt->dx;
-        evt.dy = pkt->dy;
-        evt.wheel = pkt->wheel;
-        strncpy(evt.source_tag, source_tag, sizeof(evt.source_tag)-1);
-        if (s_kvm_queue) {
-            xQueueSend(s_kvm_queue, &evt, 0);
-        }
+        portENTER_CRITICAL(&s_mouse_state.mux);
+        s_mouse_state.dx += pkt->dx;
+        s_mouse_state.dy += pkt->dy;
+        s_mouse_state.wheel += pkt->wheel;
+        s_mouse_state.buttons = pkt->buttons;
+        s_mouse_state.dirty = true;
+        portEXIT_CRITICAL(&s_mouse_state.mux);
     }
     else if (pkt_type == KVM_PKT_HEARTBEAT) {
         ESP_LOGD(TAG, "[%s] Heartbeat received", source_tag);
@@ -198,8 +262,9 @@ static void init_espnow_receiver()
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
 
-    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, No AP)", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, 24M PHY, No AP)", KVM_ESPNOW_CHANNEL);
 }
 
 static void update_display(bool force)
@@ -307,9 +372,9 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Cardputer-ADV Keyboard initialized successfully.");
     }
 
-    // 4. Create KVM USB Event Queue and Dispatcher Task
-    s_kvm_queue = xQueueCreate(64, sizeof(kvm_event_t));
-    xTaskCreate(kvm_dispatcher_task, "kvm_disp", 4096, NULL, 15, NULL);
+    // 4. Create KVM USB Event Queue and Dispatcher Task (pinned to CPU 0, separate from TinyUSB on CPU 1)
+    s_kvm_queue = xQueueCreate(256, sizeof(kvm_event_t));
+    xTaskCreatePinnedToCore(kvm_dispatcher_task, "kvm_disp", 4096, NULL, 6, NULL, 0);
 
     // 5. Initialize Pure ESP-NOW Receiver
     init_espnow_receiver();

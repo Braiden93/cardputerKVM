@@ -230,9 +230,6 @@ func (g *Grabber) Start() {
 	for _, dev := range g.devices {
 		go g.deviceReadLoop(dev)
 	}
-
-	// 8ms mouse coalescing flush ticker (125Hz polling)
-	go g.mouseFlushLoop()
 }
 
 // ToggleGrab switches between Remote Hardware Grab and Local Pass-Through
@@ -514,7 +511,7 @@ func (g *Grabber) handleRelEvent(evt InputEvent) {
 	}
 }
 
-// handleSynEvent flushes mouse displacement with sub-2ms latency
+// handleSynEvent is called on kernel EV_SYN; dispatches movement immediately with zero accumulator windup
 func (g *Grabber) handleSynEvent() {
 	g.mouseMu.Lock()
 	defer g.mouseMu.Unlock()
@@ -523,55 +520,25 @@ func (g *Grabber) handleSynEvent() {
 		return
 	}
 
-	if time.Since(g.lastMouseFlush) >= 2*time.Millisecond {
-		g.flushMouseLocked()
-	}
-}
-
-// mouseFlushLoop runs a high-frequency 2ms ticker to guarantee near-instant mouse responsiveness (500Hz)
-func (g *Grabber) mouseFlushLoop() {
-	ticker := time.NewTicker(2 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-g.done:
-			return
-		case <-ticker.C:
-			g.mu.RLock()
-			isGrabbed := g.grabbed
-			g.mu.RUnlock()
-
-			if !isGrabbed {
-				continue
-			}
-
-			g.mouseMu.Lock()
-			if g.mouseDX != 0 || g.mouseDY != 0 || g.mouseWheel != 0 {
-				g.flushMouseLocked()
-			}
-			g.mouseMu.Unlock()
-		}
-	}
-}
-
-// flushMouseLocked sends accumulated mouse deltas (called with mouseMu held)
-func (g *Grabber) flushMouseLocked() {
 	dx := clampInt8(g.mouseDX)
 	dy := clampInt8(g.mouseDY)
 	wheel := clampInt8(g.mouseWheel)
 
+	// ALWAYS reset to 0! Never leave residual windup across frames!
+	g.mouseDX = 0
+	g.mouseDY = 0
+	g.mouseWheel = 0
+
 	g.mu.RLock()
 	buttons := g.activeMouseButtons
+	isGrabbed := g.grabbed
 	g.mu.RUnlock()
 
+	if !isGrabbed {
+		return
+	}
+
 	_ = g.trans.SendMouse(buttons, dx, dy, wheel)
-
-	g.mouseDX -= int32(dx)
-	g.mouseDY -= int32(dy)
-	g.mouseWheel -= int32(wheel)
-	g.lastMouseFlush = time.Now()
-
 	g.emitMouseEvent(dx, dy, wheel)
 }
 

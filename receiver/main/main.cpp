@@ -115,33 +115,7 @@ static void kvm_dispatcher_task(void *pvParameters)
                 last_key_name = has_key ? "Remote Key" : "Released";
                 key_count++;
             } else if (evt.pkt_type == KVM_PKT_MOUSE_MOVE) {
-                // High-performance queue coalescing: merge any backlog of mouse deltas
-                int32_t total_dx = evt.dx;
-                int32_t total_dy = evt.dy;
-                int32_t total_wheel = evt.wheel;
-                uint8_t buttons = evt.buttons;
-
-                kvm_event_t next_evt;
-                while (xQueuePeek(s_kvm_queue, &next_evt, 0) == pdTRUE) {
-                    if (next_evt.pkt_type == KVM_PKT_MOUSE_MOVE) {
-                        xQueueReceive(s_kvm_queue, &next_evt, 0);
-                        total_dx += next_evt.dx;
-                        total_dy += next_evt.dy;
-                        total_wheel += next_evt.wheel;
-                        buttons = next_evt.buttons;
-                    } else {
-                        break; // Next item is a key event, preserve order
-                    }
-                }
-
-                if (total_dx > 127) total_dx = 127;
-                if (total_dx < -127) total_dx = -127;
-                if (total_dy > 127) total_dy = 127;
-                if (total_dy < -127) total_dy = -127;
-                if (total_wheel > 127) total_wheel = 127;
-                if (total_wheel < -127) total_wheel = -127;
-
-                tusb_hid_device_helper_mouse_report(buttons, (int8_t)total_dx, (int8_t)total_dy, (int8_t)total_wheel);
+                tusb_hid_device_helper_mouse_report(evt.buttons, evt.dx, evt.dy, evt.wheel);
                 last_key_name = "Mouse";
                 key_count++;
             }

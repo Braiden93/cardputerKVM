@@ -192,7 +192,10 @@ static void kvm_dispatcher_task(void *pvParameters)
                     }
                 }
                 uint8_t *keys = has_key ? evt.keycodes : NULL;
-                tusb_hid_device_helper_report(evt.modifiers, keys);
+                int retries = 50;
+                while (!tusb_hid_device_helper_report(evt.modifiers, keys) && retries-- > 0) {
+                    esp_rom_delay_us(100);
+                }
 
                 if (has_key || evt.modifiers != 0) {
                     last_kbd_event_time = esp_log_timestamp();
@@ -272,6 +275,19 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
 
     if (pkt_type == KVM_PKT_KEY_REPORT && len >= sizeof(kvm_key_packet_t)) {
         const kvm_key_packet_t *pkt = (const kvm_key_packet_t*)data;
+
+        // Sequence deduplication for redundant RF burst frames
+        static uint16_t last_key_seq = 0xFFFF;
+        static uint32_t last_key_seq_time = 0;
+        static bool has_seen_key = false;
+
+        if (has_seen_key && pkt->seq_num == last_key_seq && (now - last_key_seq_time < 500)) {
+            return; // Ignore duplicate frame from redundant burst
+        }
+        last_key_seq = pkt->seq_num;
+        last_key_seq_time = now;
+        has_seen_key = true;
+
         kvm_event_t evt = {};
         evt.pkt_type = pkt_type;
         evt.modifiers = pkt->modifiers;
@@ -345,13 +361,14 @@ static void init_espnow_receiver()
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_channel(KVM_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_12M);
 
-    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, 24M PHY, No AP)", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, 12M PHY, No PS)", KVM_ESPNOW_CHANNEL);
 }
 
 // -------------------------------------------------------------

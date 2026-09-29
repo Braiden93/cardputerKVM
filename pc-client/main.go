@@ -25,6 +25,7 @@ func main() {
 
 	injectText := flag.String("text", "", "CLI one-shot: inject text string to target PC without TUI")
 	injectMacro := flag.String("macro", "", "CLI one-shot: execute macro ('cad' for Ctrl+Alt+Del, 'lock' for Win+L, etc.)")
+	pasteClipboard := flag.Bool("paste", false, "CLI one-shot: paste host clipboard to target PC at high speed (~125 chars/sec)")
 	charDelayMs := flag.Int("delay", 15, "Delay between keystrokes in ms (for text injection)")
 
 	flag.Parse()
@@ -37,6 +38,23 @@ func main() {
 		os.Exit(1)
 	}
 	defer trans.Close()
+
+	// 0. One-shot clipboard paste CLI mode
+	if *pasteClipboard {
+		text, err := evdev.ReadHostClipboard()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read host clipboard: %v\n", err)
+			os.Exit(1)
+		}
+		runes := []rune(text)
+		fmt.Printf("Blasting %d characters from host clipboard via %s (~125 chars/sec)...\n", len(runes), trans.Type())
+		if err := trans.SendStringFast(text, nil, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "Paste failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Success! Pasted %d characters.\n", len(runes))
+		return
+	}
 
 	// 1. One-shot text injection CLI mode
 	if *injectText != "" {

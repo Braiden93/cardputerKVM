@@ -125,6 +125,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastMouseDY = evt.MouseDY
 			m.lastMouseWheel = evt.MouseWheel
 			m.lastMouseButtons = evt.MouseButtons
+
+		case evdev.EvtLog:
+			m.lastActionStatus = evt.Message
+			m.addLog(evt.Message)
 		}
 		return m, nil
 
@@ -137,6 +141,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Software toggle shortcut from terminal
 			if m.grabber != nil {
 				m.grabber.ToggleGrab()
+			}
+			return m, nil
+		case "v":
+			// Terminal shortcut to paste host clipboard
+			if m.grabber != nil {
+				go m.grabber.PasteHostClipboard()
 			}
 			return m, nil
 		case "p":
@@ -213,7 +223,7 @@ func (m Model) renderStatusStrip() string {
 		line1 := leftPart + strings.Repeat(" ", gap) + hotkey
 
 		subtext := lipgloss.NewStyle().Foreground(ColorTextDim).Render(
-			"Keystrokes & mouse stream to Cardputer HID (1000Hz) • Local desktop blocked",
+			"Keystrokes & mouse stream to Cardputer HID (1000Hz) • [Ctrl+Shift+V] Fast Host Paste",
 		)
 
 		content := line1 + "\n" + subtext
@@ -325,8 +335,8 @@ func (m Model) renderActivityLog() string {
 func (m Model) renderFooter() string {
 	return lipgloss.JoinHorizontal(lipgloss.Left,
 		FooterKey.Render("[Scroll Lock]"), FooterDesc.Render(" Toggle Target/Local  "),
-		FooterKey.Render("[Space]"), FooterDesc.Render(" Quick Toggle  "),
-		FooterKey.Render("[p]"), FooterDesc.Render(" Ping  "),
+		FooterKey.Render("[Ctrl+Shift+V]"), FooterDesc.Render(" Fast Paste  "),
+		FooterKey.Render("[v]"), FooterDesc.Render(" Quick Paste  "),
 		FooterKey.Render("[q / Ctrl+C]"), FooterDesc.Render(" Exit Client"),
 	)
 }

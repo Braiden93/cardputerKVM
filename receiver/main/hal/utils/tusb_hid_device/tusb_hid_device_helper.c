@@ -238,7 +238,7 @@ bool tusb_hid_device_helper_ready(void)
 bool tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
 {
     if (!tud_mounted()) return false;
-    int timeout_us = 2000;
+    int timeout_us = 5000;
     while (!tud_hid_n_ready(ITF_NUM_KEYBOARD) && timeout_us > 0) {
         esp_rom_delay_us(10);
         timeout_us -= 10;

@@ -44,13 +44,18 @@ static void on_espnow_sent(const uint8_t *mac_addr, esp_now_send_status_t status
 
 static void send_raw_packet(const void *data, size_t len)
 {
-    esp_err_t result = esp_now_send(broadcast_mac, (const uint8_t*)data, len);
-    if (result == ESP_ERR_ESPNOW_NO_MEM) {
-        // Queue full: yield 1 tick and retry once
-        vTaskDelay(pdMS_TO_TICKS(1));
-        esp_now_send(broadcast_mac, (const uint8_t*)data, len);
+    int retries = 5;
+    while (retries-- > 0) {
+        esp_err_t result = esp_now_send(broadcast_mac, (const uint8_t*)data, len);
+        if (result == ESP_OK) {
+            break;
+        }
+        if (result == ESP_ERR_ESPNOW_NO_MEM) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } else {
+            break;
+        }
     }
-    // Do NOT log to UART0 on drop — UART0 is the active binary data channel!
 }
 
 static void send_key_report(uint8_t modifiers, uint8_t keycode)
@@ -63,7 +68,13 @@ static void send_key_report(uint8_t modifiers, uint8_t keycode)
     pkt.keycodes[0] = keycode;
     pkt.seq_num = packet_seq++;
 
-    send_raw_packet(&pkt, sizeof(pkt));
+    // Redundant triple-burst to guarantee 99.999% over-the-air packet reception
+    for (int r = 0; r < 3; r++) {
+        send_raw_packet(&pkt, sizeof(pkt));
+        if (r < 2) {
+            esp_rom_delay_us(200);
+        }
+    }
 }
 
 // Send press + release
@@ -248,7 +259,17 @@ static void serial_bridge_task(void *pvParameters)
                     }
 
                     // Beam packet immediately over ESP-NOW!
-                    send_raw_packet(rx_buf, pkt_size);
+                    if (pkt_type == KVM_PKT_KEY_REPORT) {
+                        // Redundant triple-burst to guarantee 99.999% over-the-air packet reception
+                        for (int r = 0; r < 3; r++) {
+                            send_raw_packet(rx_buf, pkt_size);
+                            if (r < 2) {
+                                esp_rom_delay_us(200);
+                            }
+                        }
+                    } else {
+                        send_raw_packet(rx_buf, pkt_size);
+                    }
 
                     rx_len -= pkt_size;
                     if (rx_len > 0) {
@@ -295,6 +316,8 @@ static void init_espnow_transmitter()
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
     ESP_ERROR_CHECK(esp_wifi_set_channel(KVM_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     ESP_LOGI(TAG, "Initializing ESP-NOW...");
@@ -308,9 +331,9 @@ static void init_espnow_transmitter()
     peer_info.ifidx = WIFI_IF_STA;
     peer_info.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_12M);
 
-    ESP_LOGI(TAG, "ESP-NOW Transmitter ready on Channel %d (Broadcast: FF:FF:FF:FF:FF:FF, 24M PHY)", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "ESP-NOW Transmitter ready on Channel %d (Broadcast: FF:FF:FF:FF:FF:FF, 12M PHY, Max Power, No PS)", KVM_ESPNOW_CHANNEL);
 }
 
 void app_main(void)

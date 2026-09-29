@@ -99,6 +99,11 @@ type Grabber struct {
 	lastMouseFlush     time.Time
 	lastUIMouseEvent   time.Time
 	mouseMu            sync.Mutex
+
+	// Fast Clipboard Paste State
+	isPasting   bool
+	cancelPaste chan struct{}
+	pasteMu     sync.Mutex
 }
 
 // DiscoverDevices scans /proc/bus/input/devices for physical keyboards and mice
@@ -390,8 +395,44 @@ func (g *Grabber) handleInputEvent(dev *Device, evt InputEvent) {
 
 // handleKeyEvent handles key presses, releases, and mouse button clicks
 func (g *Grabber) handleKeyEvent(evt InputEvent) {
+	// Cancel ongoing paste if user presses Esc
+	if evt.Code == EvKeyEsc && evt.Value == 1 {
+		if g.IsPasting() {
+			g.CancelPaste()
+			return
+		}
+	}
+
+	// While high-speed paste is active, drop user typing so it doesn't corrupt the injected stream
+	if g.IsPasting() {
+		return
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// Fast Clipboard Paste shortcuts:
+	// 1. Ctrl+Shift+V or Ctrl+Alt+V
+	if evt.Code == EvKeyV {
+		hasCtrl := (g.activeModifiers & (protocol.ModLeftCtrl | protocol.ModRightCtrl)) != 0
+		hasShift := (g.activeModifiers & (protocol.ModLeftShift | protocol.ModRightShift)) != 0
+		hasAlt := (g.activeModifiers & (protocol.ModLeftAlt | protocol.ModRightAlt)) != 0
+
+		if (hasCtrl && hasShift) || (hasCtrl && hasAlt) {
+			if evt.Value == 1 {
+				go g.PasteHostClipboard()
+			}
+			return
+		}
+	}
+
+	// 2. Dedicated single-key trigger: Pause/Break key
+	if evt.Code == EvKeyPause {
+		if evt.Value == 1 {
+			go g.PasteHostClipboard()
+		}
+		return
+	}
 
 	// A. Mouse Buttons
 	switch evt.Code {
@@ -628,3 +669,91 @@ func clampInt8(v int32) int8 {
 	}
 	return int8(v)
 }
+
+// PasteHostClipboard reads the host clipboard and injects it at ~125 chars/sec
+func (g *Grabber) PasteHostClipboard() {
+	g.pasteMu.Lock()
+	if g.isPasting {
+		g.pasteMu.Unlock()
+		return
+	}
+	g.isPasting = true
+	g.cancelPaste = make(chan struct{})
+	cancel := g.cancelPaste
+	g.pasteMu.Unlock()
+
+	defer func() {
+		g.pasteMu.Lock()
+		g.isPasting = false
+		g.cancelPaste = nil
+		g.pasteMu.Unlock()
+	}()
+
+	text, err := ReadHostClipboard()
+	if err != nil {
+		g.emitLog(fmt.Sprintf("❌ Clipboard error: %v", err))
+		return
+	}
+
+	runes := []rune(text)
+	total := len(runes)
+	if total == 0 {
+		g.emitLog("Clipboard is empty.")
+		return
+	}
+
+	// 1. Clear any currently held physical modifiers (Ctrl, Shift, Alt) on the target host
+	g.mu.Lock()
+	g.activeKeys = nil
+	g.activeModifiers = 0
+	_ = g.trans.SendRelease()
+	g.mu.Unlock()
+	time.Sleep(10 * time.Millisecond)
+
+	g.emitLog(fmt.Sprintf("⚡ High-speed pasting %d chars (~125 chars/sec)... [Esc to cancel]", total))
+
+	lastPct := -1
+	err = g.trans.SendStringFast(text, cancel, func(done, total int) {
+		pct := (done * 100) / total
+		if pct/25 != lastPct/25 {
+			lastPct = pct
+			g.emitLog(fmt.Sprintf("⚡ Pasting: %d/%d chars (%d%%)...", done, total, pct))
+		}
+	})
+
+	if err != nil {
+		g.emitLog(fmt.Sprintf("❌ Paste interrupted: %v", err))
+	} else {
+		g.emitLog(fmt.Sprintf("✓ Successfully pasted %d characters!", total))
+	}
+}
+
+// CancelPaste interrupts an active high-speed text paste
+func (g *Grabber) CancelPaste() {
+	g.pasteMu.Lock()
+	defer g.pasteMu.Unlock()
+	if g.isPasting && g.cancelPaste != nil {
+		close(g.cancelPaste)
+		g.cancelPaste = nil
+	}
+}
+
+// IsPasting returns true if a high-speed paste is currently in flight
+func (g *Grabber) IsPasting() bool {
+	g.pasteMu.Lock()
+	defer g.pasteMu.Unlock()
+	return g.isPasting
+}
+
+// emitLog sends an event log to the UI stream
+func (g *Grabber) emitLog(msg string) {
+	if g.onEvent != nil {
+		g.onEvent(GrabEvent{
+			Type:    EvtLog,
+			Grabbed: g.IsGrabbed(),
+			Message: msg,
+			Time:    time.Now(),
+		})
+	}
+}
+

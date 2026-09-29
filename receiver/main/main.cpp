@@ -42,38 +42,6 @@ static char remote_mac_str[18] = "None";
 static uint32_t last_remote_packet_time = 0;
 static bool remote_linked = false;
 
-static void send_hid_key(uint8_t modifier, uint8_t keycode)
-{
-    if (!tusb_hid_device_helper_is_mounted()) return;
-    uint8_t keys[6] = { keycode, 0, 0, 0, 0, 0 };
-    tusb_hid_device_helper_report(modifier, keys);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    tusb_hid_device_helper_report(0, NULL);
-    vTaskDelay(pdMS_TO_TICKS(20));
-}
-
-static void send_test_greeting()
-{
-    const char* str = "Hello from Cardputer-ADV (Dell KB216)!\n";
-    ESP_LOGI(TAG, "Sending greeting: %s", str);
-    while (*str) {
-        char c = *str++;
-        uint8_t modifier = 0;
-        uint8_t key = 0;
-        if (c >= 'a' && c <= 'z') key = 0x04 + (c - 'a');
-        else if (c >= 'A' && c <= 'Z') { key = 0x04 + (c - 'A'); modifier = 0x02; }
-        else if (c >= '1' && c <= '9') key = 0x1E + (c - '1');
-        else if (c == '0') key = 0x27;
-        else if (c == ' ') key = 0x2C;
-        else if (c == '\n') key = 0x28;
-        else if (c == '!') { key = 0x1E; modifier = 0x02; }
-        else if (c == '(') { key = 0x26; modifier = 0x02; }
-        else if (c == ')') { key = 0x27; modifier = 0x02; }
-        else if (c == '-') key = 0x2D;
-        if (key) send_hid_key(modifier, key);
-    }
-}
-
 // Forward declarations
 static void process_kvm_packet(const uint8_t *data, int len, const char *source_tag);
 static void update_display(bool force = false);
@@ -306,7 +274,7 @@ static void update_display(bool force)
     if (current_mounted) {
         M5.Display.fillRect(6, 24, 228, 22, 0x03E0); // Green
         M5.Display.setTextColor(TFT_WHITE, 0x03E0);
-        M5.Display.drawCenterString("USB: CONNECTED (Dell KB216)", 120, 30);
+        M5.Display.drawCenterString("USB: CONNECTED (Dell Wireless)", 120, 30);
     } else {
         M5.Display.fillRect(6, 24, 228, 22, 0x7800); // Dark red / orange
         M5.Display.setTextColor(TFT_WHITE, 0x7800);
@@ -360,8 +328,8 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "M5Unified initialized successfully.");
 
-    // 2. Initialize TinyUSB HID with Dell KB216 Descriptors
-    ESP_LOGI(TAG, "Initializing TinyUSB HID (Dell KB216)...");
+    // 2. Initialize TinyUSB HID with Dell Wireless Combo Receiver Descriptors
+    ESP_LOGI(TAG, "Initializing TinyUSB HID (Dell Wireless Combo Receiver 413c:2501)...");
     tusb_hid_device_helper_init();
 
     // 3. Initialize Cardputer-ADV Keyboard (TCA8418 I2C Matrix)
@@ -409,8 +377,6 @@ extern "C" void app_main(void)
 
     update_display(true);
 
-    bool greeting_sent = false;
-
     // 6. Main Event Loop
     while (1) {
         M5.update();
@@ -421,23 +387,11 @@ extern "C" void app_main(void)
             was_usb_mounted = is_mounted;
             ESP_LOGI(TAG, "USB Status: %s", is_mounted ? "CONNECTED" : "DISCONNECTED");
             update_display(true);
-
-            // Auto-type greeting once after host enumeration
-            if (is_mounted && !greeting_sent) {
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                send_test_greeting();
-                greeting_sent = true;
-                last_key_name = "Greeting!";
-                update_display(true);
-            }
         }
 
-        // BtnA (G0 button on Stamp-S3)
+        // BtnA (G0 button on Stamp-S3) - manual LCD refresh
         if (M5.BtnA.wasPressed()) {
-            ESP_LOGI(TAG, "BtnA (G0) Pressed! Injecting test string...");
-            send_test_greeting();
-            last_key_name = "G0 Clicked";
-            key_count++;
+            ESP_LOGI(TAG, "BtnA (G0) Pressed! Refreshing display...");
             update_display(true);
         }
 

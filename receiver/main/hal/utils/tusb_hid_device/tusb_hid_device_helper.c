@@ -20,18 +20,32 @@ static const char *TAG = "tusb_hid";
 
 /************* TinyUSB descriptors ****************/
 
-#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_HID * TUD_HID_DESC_LEN)
+enum {
+    ITF_NUM_KEYBOARD = 0,
+    ITF_NUM_MOUSE    = 1,
+    ITF_NUM_TOTAL    = 2
+};
+
+#define EPNUM_KEYBOARD 0x81
+#define EPNUM_MOUSE    0x82
+
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN)
 
 /**
- * @brief HID report descriptor
+ * @brief Dedicated HID report descriptors
  *
- * In this example we implement Keyboard + Mouse HID device,
- * so we must define both report descriptors
+ * Dedicated standard Boot Keyboard (Interface 0)
+ * Dedicated standard Boot Mouse (Interface 1)
  */
-const uint8_t hid_report_descriptor[] = {TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(HID_ITF_PROTOCOL_KEYBOARD)),
-                                         TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(HID_ITF_PROTOCOL_MOUSE))};
+const uint8_t desc_hid_keyboard_report[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()
+};
 
-// Dell KB216 USB Device Descriptor
+const uint8_t desc_hid_mouse_report[] = {
+    TUD_HID_REPORT_DESC_MOUSE()
+};
+
+// Dell Wireless Keyboard & Mouse Combo Dongle Device Descriptor
 static const tusb_desc_device_t dell_device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
@@ -41,52 +55,55 @@ static const tusb_desc_device_t dell_device_descriptor = {
     .bDeviceProtocol    = 0x00,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0x413C, // Dell Inc.
-    .idProduct          = 0x2113, // Dell KB216 Wired Keyboard
-    .bcdDevice          = 0x0108,
-    .iManufacturer      = 0x01,
-    .iProduct           = 0x02,
-    .iSerialNumber      = 0x03,
+    .idProduct          = 0x2501, // Dell Keyboard and mouse dongle (KM636 / KM714 Wireless Combo)
+    .bcdDevice          = 0x0100, // Hardware revision 1.00
+    .iManufacturer      = 0x01,   // "Dell"
+    .iProduct           = 0x02,   // "Wireless Receiver"
+    .iSerialNumber      = 0x00,   // None (standard for genuine dongles)
     .bNumConfigurations = 0x01
 };
 
 /**
- * @brief String descriptor
+ * @brief String descriptors
  */
-const char *hid_string_descriptor[5] = {
-    // array of pointer to string descriptors
-    (char[]){0x09, 0x04},        // 0: English (0x0409)
-    "Dell",                      // 1: Manufacturer
-    "Dell KB216 Wired Keyboard", // 2: Product
-    "CN0739W9715816780123",      // 3: Serials
-    "HID Keyboard",              // 4: HID
+static const char *hid_string_descriptor[] = {
+    (char[]){0x09, 0x04}, // 0: English (0x0409)
+    "Dell",               // 1: Manufacturer
+    "Wireless Receiver",  // 2: Product
 };
 
 /**
  * @brief Configuration descriptor
  *
- * This is a simple configuration descriptor that defines 1 configuration and 1 HID interface
+ * Composite configuration with 2 distinct HID interfaces:
+ * - Interface 0: Keyboard (Boot Protocol Keyboard, 1000Hz polling)
+ * - Interface 1: Mouse (Boot Protocol Mouse, 1000Hz polling)
  */
 static const uint8_t hid_configuration_descriptor[] = {
-    // Configuration number, interface count, string index, total length, attribute, power in mA
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    // Config number, interface count (2), string index (0), total length, attribute, power in mA (98mA)
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 98),
 
-    // Interface number, string index, boot protocol, report descriptor len, EP In address, size & polling interval (1ms = 1000Hz gaming-grade polling)
-    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 1),
+    // Interface 0: Keyboard (bInterfaceSubClass=1 BOOT, bInterfaceProtocol=1 KEYBOARD, 1ms polling)
+    TUD_HID_DESCRIPTOR(ITF_NUM_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof(desc_hid_keyboard_report), EPNUM_KEYBOARD, 16, 1),
+
+    // Interface 1: Mouse (bInterfaceSubClass=1 BOOT, bInterfaceProtocol=2 MOUSE, 1ms polling)
+    TUD_HID_DESCRIPTOR(ITF_NUM_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE, sizeof(desc_hid_mouse_report), EPNUM_MOUSE, 16, 1),
 };
 
 /********* TinyUSB HID callbacks ***************/
 
 // Invoked when received GET HID REPORT DESCRIPTOR request
-// Application return pointer to descriptor, whose contents must exist long enough for transfer to complete
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
-    // We use only one interface and one HID report descriptor, so we can ignore parameter 'instance'
-    return hid_report_descriptor;
+    if (instance == ITF_NUM_KEYBOARD) {
+        return desc_hid_keyboard_report;
+    } else if (instance == ITF_NUM_MOUSE) {
+        return desc_hid_mouse_report;
+    }
+    return NULL;
 }
 
 // Invoked when received GET_REPORT control request
-// Application must fill buffer report's content and return its length.
-// Return zero will cause the stack to STALL request
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer,
                                uint16_t reqlen)
 {
@@ -95,15 +112,18 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
     (void)report_type;
     (void)buffer;
     (void)reqlen;
-
     return 0;
 }
 
-// Invoked when received SET_REPORT control request or
-// received data on OUT endpoint ( Report ID = 0, Type = 0 )
+// Invoked when received SET_REPORT control request
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer,
                            uint16_t bufsize)
 {
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)bufsize;
 }
 
 /********* Application ***************/
@@ -186,15 +206,14 @@ static void _demo_app_main(void)
     // };
     // ESP_ERROR_CHECK(gpio_config(&boot_button_config));
 
-    ESP_LOGI(TAG, "USB initialization");
+    ESP_LOGI(TAG, "USB initialization (Dell Wireless Dongle 413c:2501)");
     const tinyusb_config_t tusb_cfg = {
         .device_descriptor       = &dell_device_descriptor,
         .string_descriptor       = hid_string_descriptor,
         .string_descriptor_count = sizeof(hid_string_descriptor) / sizeof(hid_string_descriptor[0]),
         .external_phy            = false,
 #if (TUD_OPT_HIGH_SPEED)
-        .fs_configuration_descriptor =
-            hid_configuration_descriptor,  // HID configuration descriptor for full-speed and high-speed are the same
+        .fs_configuration_descriptor = hid_configuration_descriptor,
         .hs_configuration_descriptor = hid_configuration_descriptor,
         .qualifier_descriptor        = NULL,
 #else
@@ -204,17 +223,6 @@ static void _demo_app_main(void)
 
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
     ESP_LOGI(TAG, "USB initialization DONE");
-
-    // while (1) {
-    //     if (tud_mounted()) {
-    //         static bool send_hid_data = true;
-    //         if (send_hid_data) {
-    //             app_send_hid_demo();
-    //         }
-    //         send_hid_data = !gpio_get_level(APP_BUTTON);
-    //     }
-    //     vTaskDelay(pdMS_TO_TICKS(100));
-    // }
 }
 
 void tusb_hid_device_helper_init(void)
@@ -224,35 +232,35 @@ void tusb_hid_device_helper_init(void)
 
 bool tusb_hid_device_helper_ready(void)
 {
-    return tud_mounted() && tud_hid_n_ready(0);
+    return tud_mounted() && (tud_hid_n_ready(ITF_NUM_KEYBOARD) || tud_hid_n_ready(ITF_NUM_MOUSE));
 }
 
 bool tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
 {
     if (!tud_mounted()) return false;
     int timeout_us = 2000;
-    while (!tud_hid_n_ready(0) && timeout_us > 0) {
+    while (!tud_hid_n_ready(ITF_NUM_KEYBOARD) && timeout_us > 0) {
         esp_rom_delay_us(10);
         timeout_us -= 10;
     }
-    return tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, modifier, keycode);
+    return tud_hid_n_keyboard_report(ITF_NUM_KEYBOARD, 0, modifier, keycode);
 }
 
 bool tusb_hid_device_helper_mouse_report(uint8_t buttons, int8_t x, int8_t y, int8_t vertical)
 {
     if (!tud_mounted()) return false;
     int timeout_us = 2000;
-    while (!tud_hid_n_ready(0) && timeout_us > 0) {
+    while (!tud_hid_n_ready(ITF_NUM_MOUSE) && timeout_us > 0) {
         esp_rom_delay_us(10);
         timeout_us -= 10;
     }
-    return tud_hid_mouse_report(HID_ITF_PROTOCOL_MOUSE, buttons, x, y, vertical, 0);
+    return tud_hid_n_mouse_report(ITF_NUM_MOUSE, 0, buttons, x, y, vertical, 0);
 }
 
 bool tusb_hid_device_helper_mouse_report_nowait(uint8_t buttons, int8_t x, int8_t y, int8_t vertical)
 {
-    if (!tud_mounted() || !tud_hid_n_ready(0)) return false;
-    return tud_hid_mouse_report(HID_ITF_PROTOCOL_MOUSE, buttons, x, y, vertical, 0);
+    if (!tud_mounted() || !tud_hid_n_ready(ITF_NUM_MOUSE)) return false;
+    return tud_hid_n_mouse_report(ITF_NUM_MOUSE, 0, buttons, x, y, vertical, 0);
 }
 
 bool tusb_hid_device_helper_is_mounted(void)

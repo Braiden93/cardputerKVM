@@ -298,7 +298,7 @@ func (m Model) renderLinkTelemetryCard() string {
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Wire Endpoint:"), StatValueDim.Render(ep)),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Serial Baud:"), StatValue.Render("921,600 (97µs/pkt)")),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("RF Protocol:"), lipgloss.NewStyle().Foreground(ColorGreen).Render("ESP-NOW Ch 1 (24M PHY)")),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Target Spoof:"), lipgloss.NewStyle().Foreground(ColorYellow).Render("Dell KB216 + Mouse")),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Target Spoof:"), lipgloss.NewStyle().Foreground(ColorYellow).Render("Dell Dongle (413C:2501)")),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Packets Sent:"), StatValue.Render(fmt.Sprintf("%d pkts", stats.PacketsSent))),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Link State:"), lipgloss.NewStyle().Bold(true).Foreground(ColorGreen).Render("● Synchronized")),
 	)

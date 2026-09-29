@@ -1,0 +1,14 @@
+[submodule "receiver/components/M5GFX"]
+	path = receiver/components/M5GFX
+	url = https://github.com/m5stack/M5GFX.git
+	ignore = dirty
+
+[submodule "receiver/components/M5Unified"]
+	path = receiver/components/M5Unified
+	url = https://github.com/m5stack/M5Unified.git
+	ignore = dirty
+
+[submodule "receiver/components/mooncake_log"]
+	path = receiver/components/mooncake_log
+	url = https://github.com/Forairaaaaa/mooncake_log.git
+	ignore = dirty

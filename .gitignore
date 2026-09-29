@@ -8,6 +8,7 @@ esp-sdk/
 # ==========================================
 build/
 **/build/
+cmake-build-*/
 sdkconfig
 **/sdkconfig
 sdkconfig.old
@@ -21,33 +22,67 @@ managed_components/
 *.map
 *.hex
 *.uf2
+*.dis
 
 # ==========================================
-# Python & Scripts
+# Go Binaries & Artifacts (pc-client)
+# ==========================================
+cardputer-kvm
+cardputer-kvm.exe
+**/cardputer-kvm
+**/cardputer-kvm.exe
+*.test
+*.prof
+
+# ==========================================
+# Android Client & Gradle Artifacts
+# ==========================================
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+*.dex
+*.class
+.cxx/
+captures/
+
+# ==========================================
+# Python, Virtual Environments & Scripts
 # ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
+env/
 .pytest_cache/
 
 # ==========================================
-# Client Build Directories & Binaries
+# Logs & Temporary Files
 # ==========================================
-node_modules/
-.gradle/
-**/build/
-cardputer-kvm
-cardputer-kvm.exe
+*.log
+*.tmp
 
 # ==========================================
-# Editors & Operating System
+# Editors, IDEs & Tooling
 # ==========================================
 .vscode/
 .idea/
+*.iml
 *.sublime-project
 *.sublime-workspace
+*.swp
+*.swo
+*~
+node_modules/
+
+# ==========================================
+# Operating System Files
+# ==========================================
 .DS_Store
 Thumbs.db
+ehthumbs.db
+.directory
 .fuse_hidden*
+.Trash-*

@@ -50,3 +50,4 @@ cardputer-kvm.exe
 *.sublime-workspace
 .DS_Store
 Thumbs.db
+.fuse_hidden*

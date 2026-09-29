@@ -17,9 +17,6 @@ func main() {
 	// Flags
 	serialPort := flag.String("serial", "", "Serial port for ESP32-S3 transmitter dongle (e.g. /dev/ttyUSB0, auto-detected if empty)")
 	baudRate := flag.Int("baud", 115200, "Serial baud rate")
-	useUDP := flag.Bool("udp", false, "Use direct Wi-Fi UDP instead of serial dongle")
-	targetIP := flag.String("target", "192.168.4.1", "Cardputer receiver IP (only if -udp is enabled)")
-	targetPort := flag.Int("port", 8888, "Cardputer receiver UDP port (only if -udp is enabled)")
 
 	injectText := flag.String("text", "", "CLI one-shot: inject text string to target PC without TUI")
 	injectMacro := flag.String("macro", "", "CLI one-shot: execute macro ('cad' for Ctrl+Alt+Del, 'lock' for Win+L, etc.)")
@@ -27,24 +24,12 @@ func main() {
 
 	flag.Parse()
 
-	var trans transport.Transport
-	var err error
-
-	if *useUDP {
-		endpoint := fmt.Sprintf("%s:%d", *targetIP, *targetPort)
-		trans, err = transport.NewUDPTransport(endpoint)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error initializing UDP transport to %s: %v\n", endpoint, err)
-			os.Exit(1)
-		}
-	} else {
-		// Default: Serial Dongle mode (PC -> ESP32-S3 via USB wire)
-		trans, err = transport.NewSerialTransport(*serialPort, *baudRate)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error connecting to ESP32-S3 transmitter: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Tip: Verify your ESP32-S3 is plugged into USB. Use -serial <device> or -udp\n")
-			os.Exit(1)
-		}
+	// Connect to ESP32-S3 transmitter dongle via USB cable
+	trans, err := transport.NewSerialTransport(*serialPort, *baudRate)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error connecting to ESP32-S3 transmitter dongle: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tip: Ensure your ESP32-S3 is plugged into USB. Use -serial <device>\n")
+		os.Exit(1)
 	}
 	defer trans.Close()
 

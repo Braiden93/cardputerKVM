@@ -74,11 +74,6 @@ static void send_test_greeting()
     }
 }
 
-#include "lwip/err.h"
-#include "lwip/sockets.h"
-#include "lwip/sys.h"
-#include <lwip/netdb.h>
-
 // Forward declarations
 static void process_kvm_packet(const uint8_t *data, int len, const char *source_tag);
 static void update_display(bool force = false);
@@ -186,47 +181,9 @@ static void on_espnow_recv(const esp_now_recv_info_t *recv_info, const uint8_t *
     process_kvm_packet(data, len, "ESP-NOW");
 }
 
-// UDP Socket Server Task (for PC Client & Android Client over Wi-Fi)
-static void udp_server_task(void *pvParameters)
+static void init_espnow_receiver()
 {
-    uint8_t rx_buffer[128];
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(8888);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Unable to create UDP socket: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    if (err < 0) {
-        ESP_LOGE(TAG, "UDP Socket unable to bind: errno %d", errno);
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "UDP Server listening on 0.0.0.0:8888");
-
-    while (1) {
-        struct sockaddr_storage source_addr;
-        socklen_t socklen = sizeof(source_addr);
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
-
-        if (len > 0) {
-            snprintf(remote_mac_str, sizeof(remote_mac_str), "Wi-Fi (UDP)");
-            process_kvm_packet(rx_buffer, len, "UDP");
-        }
-    }
-}
-
-static void init_wireless_receiver()
-{
-    ESP_LOGI(TAG, "Initializing Wi-Fi AP+STA, ESP-NOW and UDP Server on Channel %d...", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "Initializing Pure ESP-NOW Receiver on Channel %d...", KVM_ESPNOW_CHANNEL);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -239,33 +196,18 @@ static void init_wireless_receiver()
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_sta();
-    esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-
-    // Configure SoftAP
-    wifi_config_t ap_config = {};
-    const char *ssid = "Cardputer-KVM";
-    strncpy((char*)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid));
-    ap_config.ap.ssid_len = strlen(ssid);
-    ap_config.ap.channel = KVM_ESPNOW_CHANNEL;
-    ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    ap_config.ap.max_connection = 4;
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(KVM_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
 
-    // Launch UDP Server Task
-    xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
-
-    ESP_LOGI(TAG, "Wireless Receiver ready: ESP-NOW + UDP (SoftAP: %s, Ch: %d)", ssid, KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, No AP)", KVM_ESPNOW_CHANNEL);
 }
 
 static void update_display(bool force)
@@ -343,14 +285,14 @@ static void update_display(bool force)
     // Bottom Help Line
     M5.Display.fillRect(0, 118, 240, 17, TFT_BLACK);
     M5.Display.setTextColor(0x07FF, TFT_BLACK); // Cyan
-    M5.Display.drawCenterString("AP: Cardputer-KVM (192.168.4.1)", 120, 121);
+    M5.Display.drawCenterString("ESP-NOW CH 1 | Pure RF Wireless", 120, 121);
 
     M5.Display.endWrite();
 }
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Cardputer-ADV KVM Receiver + ESP-NOW + UDP ===");
+    ESP_LOGI(TAG, "=== Cardputer-ADV KVM Receiver (Pure ESP-NOW) ===");
 
     // 1. Initialize M5Unified (Display, Power Management, Battery, I2C)
     auto cfg = M5.config();
@@ -377,8 +319,8 @@ extern "C" void app_main(void)
     s_kvm_queue = xQueueCreate(64, sizeof(kvm_event_t));
     xTaskCreate(kvm_dispatcher_task, "kvm_disp", 4096, NULL, 10, NULL);
 
-    // 5. Initialize Wireless Receiver (ESP-NOW + SoftAP + UDP Server)
-    init_wireless_receiver();
+    // 5. Initialize Pure ESP-NOW Receiver
+    init_espnow_receiver();
 
     // 6. Hook Local Keyboard Event Callback
     keyboard.onKeyEvent.connect([](const Keyboard::KeyEvent_t& keyEvent) {

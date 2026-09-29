@@ -33,11 +33,13 @@ venv/
 .pytest_cache/
 
 # ==========================================
-# Client Build Directories
+# Client Build Directories & Binaries
 # ==========================================
 node_modules/
 .gradle/
 **/build/
+cardputer-kvm
+cardputer-kvm.exe
 
 # ==========================================
 # Editors & Operating System

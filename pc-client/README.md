@@ -2,17 +2,42 @@
 
 A high-performance, single-binary Terminal User Interface (TUI) client written in **Go** using [Bubbletea](https://github.com/charmbracelet/bubbletea) and [Lipgloss](https://github.com/charmbracelet/lipgloss).
 
-The PC Client allows any Linux, macOS, or Windows machine to act as a wireless remote KVM controller, transmitting low-latency keystrokes, macros, and script injections over Wi-Fi / UDP directly to the **M5Stack Cardputer-ADV Receiver** plugged into the target host machine.
+The PC Client turns your workstation into a remote KVM station: it communicates directly over **USB Serial** with an **ESP32-S3 Transmitter Dongle** plugged into your PC. The transmitter then beams all keyboard and mouse packets over **ESP-NOW (2.4 GHz RF)** to the **M5Stack Cardputer-ADV Receiver** plugged into the target host computer.
 
 ---
 
-## 1. Key Features
+## 1. System Architecture
 
-- **Single Standalone Binary:** Zero runtime dependencies or interpreters; compiles into an ultra-compact (~4–6 MB) executable.
+```mermaid
+graph LR
+    subgraph Control Workstation
+        P[PC Client: cardputer-kvm] -->|USB Serial Cable: /dev/ttyUSB0| T[Transmitter: ESP32-S3 Dongle]
+    end
+
+    subgraph Wireless Link
+        T -->|ESP-NOW 2.4 GHz RF / Channel 1| R[Receiver: M5Stack Cardputer-ADV]
+    end
+
+    subgraph Target Host PC
+        R -->|Native USB-C OTG| H[Target Machine]
+        H -.->|Detects 0x413C:0x2113| D[Dell KB216 Wired Keyboard + Mouse]
+    end
+```
+
+- **Zero Network Setup:** No Wi-Fi routers, no IP addresses, no DHCP. Plug in the ESP32-S3 transmitter via USB cable, launch the client, and start typing.
+- **Ultra-Low Latency:** Direct UART connection (115200 baud) + connectionless 2.4 GHz ESP-NOW frames (~2–5 ms round-trip).
+
+---
+
+## 2. Key Features
+
+- **Single Standalone Binary:** Zero runtime dependencies or interpreters; compiles into an ultra-compact **4.0MB static binary**.
+- **Auto-Detection:** Automatically discovers plugged-in ESP32-S3 boards on `/dev/ttyUSB*` (CH340) or `/dev/ttyACM*` (Native USB).
 - **Cyberpunk / Slate TUI Aesthetics:** Rich truecolor terminal interface featuring glowing status badges, active key HUDs, and real-time telemetry.
-- **4 Operational Modes:**
-  1. **`[1] LIVE CAPTURE (Raw KVM)`**: Captures all keypresses in the terminal (functional keys F1–F12, arrows, backspace, modifiers) and beams standard 6KRO USB HID packets to the Cardputer.
-  2. **`[2] MACRO DECK`**: One-touch shortcuts for tricky remote combinations:
+- **5 Operational Modes:**
+  1. **`[1] KEYBOARD CAPTURE`**: Captures every keypress in the terminal (functional keys F1–F12, arrows, backspace, modifiers) and beams standard 6KRO USB HID packets. Features an escape hatch (`Esc` or `Ctrl+Q` to pause capture).
+  2. **`[2] MOUSE TRACKPAD`**: Control remote mouse cursor directly from terminal using arrow keys / `h-j-k-l`, with click buttons (`Space`/`Enter` for Left Click, `r` for Right Click, `m` for Middle Click) and scroll wheel (`w`/`s`). Hold `Alt` for 3x turbo cursor speed.
+  3. **`[3] MACRO DECK`**: One-touch system shortcuts:
      - `[1]` `Ctrl+Alt+Del` (Windows Security / Sign-out / Task Manager)
      - `[2]` `Alt+Tab` (Window Switcher)
      - `[3]` `Win+R` (Run Dialog)
@@ -24,32 +49,14 @@ The PC Client allows any Linux, macOS, or Windows machine to act as a wireless r
      - `[9]` `Win+D` (Show Desktop)
      - `[0]` `Win+E` (File Explorer)
      - `[c]` `Ctrl+C` / `[v]` `Ctrl+V` (Copy / Paste)
-  3. **`[3] TEXT INJECTOR`**: Input / paste multi-line commands, URLs, or shell scripts and stream them character-by-character into the target host at configurable speed (default 15ms delay).
-  4. **`[4] TELEMETRY`**: Real-time packet counters, payload size, latency tracking, socket error monitors, and manual heartbeat ping trigger.
+  4. **`[4] TEXT INJECTOR`**: Input / paste multi-line commands, URLs, or shell scripts and stream them character-by-character into the target host at configurable speed (default 15ms delay).
+  5. **`[5] TELEMETRY`**: Real-time packet counters, payload size, latency tracking, IO error monitors, and manual heartbeat ping trigger.
 - **Non-Interactive CLI Mode:** Run single commands directly from bash scripts or automation pipelines without opening the TUI:
   ```bash
   ./cardputer-kvm -text "sudo apt update && sudo apt upgrade -y"
   ./cardputer-kvm -macro cad
+  ./cardputer-kvm -macro lock
   ```
-
----
-
-## 2. Architecture & Wire Protocol
-
-```mermaid
-graph LR
-    P[PC Client: cardputer-kvm] -->|Wi-Fi / UDP Port 8888| C[Cardputer-ADV Receiver]
-    C -->|Native USB-C OTG| H[Target Host PC]
-
-    subgraph Spoofed Identity
-        H -.->|Detects: 0x413C:0x2113| D[Dell KB216 Wired Keyboard]
-    end
-```
-
-The wire protocol uses a packed binary format matching `kvm_protocol.h`:
-- **Magic:** `0x4B56` (`"KV"`, little-endian)
-- **Key Report Packet (`0x01`):** 12 bytes (`Magic`, `Type`, `Modifiers bitmask`, `6x HID Keycodes`, `Sequence Number`).
-- **Heartbeat Packet (`0x03`):** 9 bytes (`Magic`, `Type`, `Uptime timestamp`, `Sequence Number`).
 
 ---
 
@@ -61,48 +68,46 @@ The wire protocol uses a packed binary format matching `kvm_protocol.h`:
 ### Build Binary
 ```bash
 cd pc-client
-go build -ldflags="-s -w" -o cardputer-kvm
+make        # builds optimized stripped binary 'cardputer-kvm'
 ```
-This produces an optimized standalone binary: `cardputer-kvm`.
 
 ---
 
 ## 4. Usage
 
-### Launch Interactive TUI
-Connect to the default Cardputer-ADV SoftAP (`Cardputer-KVM` at `192.168.4.1:8888`):
+### Launch Interactive TUI (Auto-detects USB Serial Port)
 ```bash
 ./cardputer-kvm
 ```
 
-Target a custom IP on your local LAN or office network:
+### Specify a Custom Serial Port
 ```bash
-./cardputer-kvm -target 192.168.1.120 -port 8888
+./cardputer-kvm -serial /dev/ttyUSB0
 ```
 
 ### TUI Navigation Controls
 | Key | Action |
 | :--- | :--- |
-| **`Esc`** or **`Ctrl+Q`** | Release / Pause Live Capture mode |
-| **`Space`** | Resume Live Capture mode |
-| **`Tab`** / **`Shift+Tab`** | Switch between Modes (Live Capture / Macros / Text / Telemetry) |
-| **`1` – `4`** | Jump directly to Tab 1, 2, 3, or 4 |
+| **`Esc`** or **`Ctrl+Q`** | Pause / Release Keyboard Capture mode |
+| **`Space`** | Resume Keyboard Capture mode (in Tab 1) |
+| **`Tab`** / **`Shift+Tab`** | Switch between Modes (Keyboard / Mouse / Macros / Text / Telemetry) |
+| **`1` – `5`** | Jump directly to Tab 1, 2, 3, 4, or 5 |
 | **`q`** | Quit application (when outside capture mode) |
 
 ### CLI One-Shot Automation
 Send text without opening the TUI:
 ```bash
-./cardputer-kvm -target 192.168.4.1 -text "git status\n"
+./cardputer-kvm -text "git status\n"
 ```
 
 Trigger `Ctrl+Alt+Del`:
 ```bash
-./cardputer-kvm -target 192.168.4.1 -macro cad
+./cardputer-kvm -macro cad
 ```
 
 Trigger `Win+L` (Workstation lock):
 ```bash
-./cardputer-kvm -target 192.168.4.1 -macro lock
+./cardputer-kvm -macro lock
 ```
 
 ---
@@ -111,14 +116,15 @@ Trigger `Win+L` (Workstation lock):
 
 ```text
 pc-client/
+├── Makefile                   # Build, run, tidy helpers
 ├── go.mod                     # Go module definitions
 ├── go.sum                     # Checksums
 ├── main.go                    # Entry point & CLI flag parser
 ├── pkg/
 │   ├── protocol/
-│   │   └── protocol.go        # Protocol packing, HID key table & conversions
+│   │   └── protocol.go        # Protocol packing, HID key/mouse table & conversions
 │   ├── transport/
-│   │   └── transport.go       # UDP socket client & telemetry tracker
+│   │   └── transport.go       # Serial dongle client & telemetry tracker
 │   └── ui/
 │       ├── styles.go          # Lipgloss palette & cyber/slate theme
 │       └── ui.go              # Bubbletea Elm model, view renderers & event loop

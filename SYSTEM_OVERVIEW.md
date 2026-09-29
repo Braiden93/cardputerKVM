@@ -5,21 +5,21 @@
 
 ```mermaid
 graph TD
-    subgraph Input / Control Transmitters
-        T[Transmitter: ESP32-S3 Remote]
-        A[Android Client: Mobile App]
-        P[PC Client: Desktop App]
+    subgraph Control Workstation
+        P[PC Client: cardputer-kvm] -->|USB Serial Cable: /dev/ttyUSB0| T[Transmitter: ESP32-S3 Dongle]
     end
 
-    subgraph Host PC & Smart Receiver
-        R[Receiver: M5Stack Cardputer-ADV]
-        PC[Target Host Machine / PC]
+    subgraph Mobile Controller
+        A[Android Client: Mobile App] -.->|Wi-Fi / UDP| R
     end
 
-    T -->|ESP-NOW / 2.4 GHz RF| R
-    A -.->|Wi-Fi / UDP| R
-    P -.->|Wi-Fi / UDP| R
-    R -->|Native USB-C OTG / Dell HID Spoof| PC
+    subgraph RF Wireless Link
+        T -->|ESP-NOW / 2.4 GHz RF Channel 1| R[Receiver: M5Stack Cardputer-ADV]
+    end
+
+    subgraph Target Host Machine
+        R -->|Native USB-C OTG / Dell HID Spoof| PC[Target Host Machine / PC]
+    end
 ```
 
 ---
@@ -28,9 +28,9 @@ graph TD
 
 | Directory | Target Hardware / Platform | Role & Primary Responsibilities |
 | :--- | :--- | :--- |
-| **`receiver/`** | **M5Stack Cardputer-ADV** | **Primary Smart KVM Receiver:** Plugs directly into the target host via USB-C. Uses ESP32-S3 native USB OTG to emulate a **Dell KB216 Wired Keyboard** (`0x413C:0x2113`). Features a 1.14" ST7789 display for live connection status, battery, and input telemetry, plus local keyboard override. |
-| **`transmitter/`** | **ESP32-S3** (Remote / Uno / Custom) | **Handheld Wireless Transmitter:** Captures user keystrokes / controls and transmits low-latency packets to the Cardputer-ADV receiver via **ESP-NOW**. |
-| **`pc-client/`** | Desktop OS (Linux / Windows) | **PC Remote Console:** Companion desktop app to send keystrokes, shortcuts, and macros over the network to the Cardputer receiver. |
+| **`receiver/`** | **M5Stack Cardputer-ADV** | **Primary Smart KVM Receiver:** Plugs directly into the target host via USB-C. Uses ESP32-S3 native USB OTG to emulate a **Dell KB216 Wired Keyboard + Mouse** (`0x413C:0x2113`). Features a 1.14" ST7789 display for live connection status, battery, and input telemetry, plus local keyboard override. |
+| **`transmitter/`** | **ESP32-S3** (N16R8 / Custom) | **Handheld Wireless Transmitter / USB Dongle:** Connects to PC via USB cable (UART bridge). Relays keyboard and mouse packets from the PC client to the Cardputer receiver over **ESP-NOW**. Also functions standalone with onboard buttons. |
+| **`pc-client/`** | Desktop OS (Linux / Windows / macOS) | **PC Remote Console (Go TUI):** High-performance Bubbletea TUI application. Communicates directly with the ESP32-S3 transmitter dongle via USB serial to beam raw keystrokes, virtual mouse movements, macros, and scripts. |
 | **`android-client/`** | Android Mobile OS | **Mobile Remote Controller:** Touchpad, virtual keyboard, and remote control over Wi-Fi/BLE. |
 | **`esp-sdk/`** | Local ESP-IDF Framework | **Toolchain & Core Framework:** Local ESP-IDF v5.3 repository used to build all embedded targets. |
 
@@ -38,12 +38,11 @@ graph TD
 
 ## 3. Communication Strategy
 
-### Primary Link: `Transmitter` ↔ `Receiver (Cardputer-ADV)`
-* **Protocol: ESP-NOW (2.4 GHz Peer-to-Peer RF)**
-  * Router-free, connectionless direct RF packets between Transmitter and Cardputer-ADV.
-  * Near-zero latency (~2–5 ms), ideal for seamless typing, key holds, and combinations.
-  * Encryption available via PMK/LMK pairing.
-* **Secondary / Network Link:** Wi-Fi SoftAP / UDP sockets for `android-client` and `pc-client`.
+### Primary Link: `PC Client` ↔ `Transmitter (ESP32-S3)` ↔ `Receiver (Cardputer-ADV)`
+* **Workstation to Transmitter:** USB Serial Cable (`/dev/ttyUSB0` or `/dev/ttyACM0` at 115200 baud). High-speed binary packet framing with auto-port detection.
+* **Transmitter to Receiver:** ESP-NOW 2.4 GHz Peer-to-Peer RF (Channel 1, broadcast pairing). Near-zero latency (~2–5 ms), router-free.
+* **Receiver to Target Host:** Native USB OTG emulating Dell KB216 Keyboard and Mouse.
+* **Secondary / Network Link:** Wi-Fi SoftAP / UDP sockets available for `android-client`.
 
 ---
 

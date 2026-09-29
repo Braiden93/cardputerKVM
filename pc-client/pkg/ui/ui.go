@@ -17,9 +17,10 @@ type TabMode int
 
 const (
 	TabLiveCapture TabMode = 0
-	TabMacros      TabMode = 1
-	TabInjector    TabMode = 2
-	TabTelemetry   TabMode = 3
+	TabMouse       TabMode = 1
+	TabMacros      TabMode = 2
+	TabInjector    TabMode = 3
+	TabTelemetry   TabMode = 4
 )
 
 type HeartbeatTickMsg time.Time
@@ -43,6 +44,11 @@ type Model struct {
 	lastActionStatus string
 	actionErr        string
 	lastPacketTime   time.Time
+
+	// Mouse State
+	mouseButtons byte
+	lastMouseDX  int8
+	lastMouseDY  int8
 
 	// Macro Selection
 	macroIndex int
@@ -85,11 +91,11 @@ func NewModel(trans transport.Transport) Model {
 		captureActive:    true,
 		lastKeyPressed:   "None",
 		lastKeyHex:       "Mod: 0x00 | Code: 0x00",
-		lastActionStatus: "Ready — Target: " + trans.Endpoint(),
+		lastActionStatus: "Ready — Link: " + trans.Endpoint(),
 		macros:           macros,
 		textInput:        ti,
 		injectDelayMs:    15,
-		activityLog:      []string{"System initialized. Spoofed profile: Dell KB216 Wired Keyboard"},
+		activityLog:      []string{"System initialized. Channel: " + trans.Type() + " -> ESP-NOW -> Cardputer"},
 	}
 
 	return m
@@ -137,8 +143,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		// When in Live Capture Mode:
-		if m.captureActive {
+		// When in Live Capture Mode (Keyboard):
+		if m.captureActive && m.activeTab == TabLiveCapture {
 			// Escape hatch from capture mode: double Esc, or Ctrl+Q, or F12
 			if msg.Type == tea.KeyEsc || msg.String() == "ctrl+q" || msg.Type == tea.KeyF12 {
 				m.captureActive = false
@@ -147,7 +153,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Forward key to Cardputer!
+			// Forward key to Transmitter!
 			mod, code, desc := parseKeyToHID(msg)
 			if code != protocol.KeyNone || mod != protocol.ModNone {
 				err := m.trans.SendKey(mod, code)
@@ -159,8 +165,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.addLog(fmt.Sprintf("ERR sending %s: %v", desc, err))
 				} else {
 					m.actionErr = ""
-					m.lastActionStatus = fmt.Sprintf("Injected %s -> Cardputer -> Host PC", desc)
-					m.addLog(fmt.Sprintf("Sent key: %s (0x%02X)", desc, code))
+					m.lastActionStatus = fmt.Sprintf("Forwarded %s -> ESP32-S3 -> Cardputer -> Host PC", desc)
+					m.addLog(fmt.Sprintf("Key sent: %s (0x%02X)", desc, code))
 				}
 			}
 			return m, nil
@@ -169,7 +175,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Navigation when outside Capture Mode:
 		switch msg.String() {
 		case "tab":
-			m.activeTab = (m.activeTab + 1) % 4
+			m.activeTab = (m.activeTab + 1) % 5
 			return m, nil
 		case "shift+tab":
 			if m.activeTab == 0 {
@@ -185,15 +191,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "2":
 			if m.activeTab != TabMacros && m.activeTab != TabInjector {
-				m.activeTab = TabMacros
+				m.activeTab = TabMouse
 				return m, nil
 			}
 		case "3":
 			if m.activeTab != TabMacros && m.activeTab != TabInjector {
-				m.activeTab = TabInjector
+				m.activeTab = TabMacros
 				return m, nil
 			}
 		case "4":
+			if m.activeTab != TabMacros && m.activeTab != TabInjector {
+				m.activeTab = TabInjector
+				return m, nil
+			}
+		case "5":
 			if m.activeTab != TabMacros && m.activeTab != TabInjector {
 				m.activeTab = TabTelemetry
 				return m, nil
@@ -208,8 +219,75 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Tab-specific handlers when outside capture mode
+		// Tab-specific handlers
 		switch m.activeTab {
+		case TabMouse:
+			// Virtual Mouse Pad Controls
+			step := int8(12)
+			if msg.Alt {
+				step = int8(32) // Turbo mode
+			}
+			switch msg.String() {
+			case "up", "k":
+				_ = m.trans.SendMouse(0, 0, -step, 0)
+				m.lastMouseDY = -step
+				m.lastMouseDX = 0
+				m.lastActionStatus = fmt.Sprintf("Mouse Move: dY=%d", -step)
+				return m, nil
+			case "down", "j":
+				_ = m.trans.SendMouse(0, 0, step, 0)
+				m.lastMouseDY = step
+				m.lastMouseDX = 0
+				m.lastActionStatus = fmt.Sprintf("Mouse Move: dY=%d", step)
+				return m, nil
+			case "left", "h":
+				_ = m.trans.SendMouse(0, -step, 0, 0)
+				m.lastMouseDX = -step
+				m.lastMouseDY = 0
+				m.lastActionStatus = fmt.Sprintf("Mouse Move: dX=%d", -step)
+				return m, nil
+			case "right", "l":
+				_ = m.trans.SendMouse(0, step, 0, 0)
+				m.lastMouseDX = step
+				m.lastMouseDY = 0
+				m.lastActionStatus = fmt.Sprintf("Mouse Move: dX=%d", step)
+				return m, nil
+			case "enter", " ":
+				// Left Click (press and release)
+				_ = m.trans.SendMouse(protocol.MouseBtnLeft, 0, 0, 0)
+				time.Sleep(30 * time.Millisecond)
+				_ = m.trans.SendMouse(0, 0, 0, 0)
+				m.lastActionStatus = "Mouse: Left Click"
+				m.addLog("Mouse Left Click")
+				return m, nil
+			case "r":
+				// Right Click
+				_ = m.trans.SendMouse(protocol.MouseBtnRight, 0, 0, 0)
+				time.Sleep(30 * time.Millisecond)
+				_ = m.trans.SendMouse(0, 0, 0, 0)
+				m.lastActionStatus = "Mouse: Right Click"
+				m.addLog("Mouse Right Click")
+				return m, nil
+			case "m":
+				// Middle Click
+				_ = m.trans.SendMouse(protocol.MouseBtnMiddle, 0, 0, 0)
+				time.Sleep(30 * time.Millisecond)
+				_ = m.trans.SendMouse(0, 0, 0, 0)
+				m.lastActionStatus = "Mouse: Middle Click"
+				m.addLog("Mouse Middle Click")
+				return m, nil
+			case "w":
+				// Scroll Up
+				_ = m.trans.SendMouse(0, 0, 0, 1)
+				m.lastActionStatus = "Mouse: Wheel Up"
+				return m, nil
+			case "s":
+				// Scroll Down
+				_ = m.trans.SendMouse(0, 0, 0, -1)
+				m.lastActionStatus = "Mouse: Wheel Down"
+				return m, nil
+			}
+
 		case TabMacros:
 			// Execute macro by key
 			keyStr := msg.String()
@@ -260,7 +338,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.actionErr = err.Error()
 				} else {
 					m.addLog("Manual heartbeat ping dispatched.")
-					m.lastActionStatus = "Heartbeat ping sent to Cardputer"
+					m.lastActionStatus = "Heartbeat ping sent to Transmitter"
 				}
 				return m, nil
 			}
@@ -363,8 +441,8 @@ func (m Model) View() string {
 
 	// 1. Top Header Banner
 	title := HeaderTitle.Render("CARDPUTER-KVM")
-	badge := HeaderBadge.Render("PC CONSOLE v1.0")
-	profile := HeaderProfile.Render("EMULATION: Dell KB216 (0x413C:0x2113)")
+	badge := HeaderBadge.Render(m.trans.Type() + " LINK")
+	profile := HeaderProfile.Render("HOST: Dell KB216 (0x413C:0x2113)")
 
 	var statusBadge string
 	if m.trans != nil && m.trans.IsConnected() {
@@ -377,7 +455,7 @@ func (m Model) View() string {
 	s.WriteString(topBar + "\n\n")
 
 	// 2. Navigation Tabs
-	tabNames := []string{"[1] LIVE CAPTURE", "[2] MACRO DECK", "[3] TEXT INJECTOR", "[4] TELEMETRY"}
+	tabNames := []string{"[1] KEYBOARD CAPTURE", "[2] MOUSE TRACKPAD", "[3] MACRO DECK", "[4] TEXT INJECTOR", "[5] TELEMETRY"}
 	var tabs []string
 	for i, name := range tabNames {
 		if TabMode(i) == m.activeTab {
@@ -392,6 +470,8 @@ func (m Model) View() string {
 	switch m.activeTab {
 	case TabLiveCapture:
 		s.WriteString(m.renderLiveCaptureView())
+	case TabMouse:
+		s.WriteString(m.renderMouseView())
 	case TabMacros:
 		s.WriteString(m.renderMacrosView())
 	case TabInjector:
@@ -418,7 +498,7 @@ func (m Model) renderLiveCaptureView() string {
 			Foreground(ColorSlateBg).
 			Background(ColorGreen).
 			Padding(0, 2).
-			Render("● LIVE KEYBOARD CAPTURE ENGAGED — ALL INPUT ROUTED DIRECTLY TO TARGET HOST")
+			Render("● LIVE KEYBOARD CAPTURE ENGAGED — BEAMING VIA " + m.trans.Type() + " -> ESP-NOW -> HOST")
 		content.WriteString(banner + "\n\n")
 
 		hudTitle := lipgloss.NewStyle().Bold(true).Foreground(ColorTextDim).Render("ACTIVE TRANSMITTED KEY:")
@@ -429,10 +509,10 @@ func (m Model) renderLiveCaptureView() string {
 			hudTitle,
 			"\n"+keyDisplay+"\n",
 			hexDisplay,
-			"\n"+lipgloss.NewStyle().Foreground(ColorYellow).Render("Press [Esc] or [Ctrl+Q] to release capture mode"),
+			"\n"+lipgloss.NewStyle().Foreground(ColorYellow).Render("Press [Esc] or [Ctrl+Q] to pause capture mode"),
 		)
 
-		box := CardBoxActive.Width(72).Render(hudContent)
+		box := CardBoxActive.Width(76).Render(hudContent)
 		content.WriteString(box)
 	} else {
 		banner := lipgloss.NewStyle().
@@ -444,16 +524,36 @@ func (m Model) renderLiveCaptureView() string {
 		content.WriteString(banner + "\n\n")
 
 		pausedMsg := lipgloss.JoinVertical(lipgloss.Center,
-			lipgloss.NewStyle().Bold(true).Foreground(ColorText).Render("Keyboard forwarding is currently suspended."),
-			"\n"+lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("Press [SPACEBAR] to resume live wireless typing!"),
-			"\n"+lipgloss.NewStyle().Foreground(ColorTextDim).Render("Or press [Tab] to browse Macros and Text Injector tools."),
+			lipgloss.NewStyle().Bold(true).Foreground(ColorText).Render("Keyboard capture paused. Terminal is local."),
+			"\n"+lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("Press [SPACEBAR] to resume live typing to remote host!"),
+			"\n"+lipgloss.NewStyle().Foreground(ColorTextDim).Render("Or press [Tab] / [2-5] to browse Mouse, Macros, and Injector."),
 		)
 
-		box := CardBox.Width(72).Render(pausedMsg)
+		box := CardBox.Width(76).Render(pausedMsg)
 		content.WriteString(box)
 	}
 
 	return content.String()
+}
+
+func (m Model) renderMouseView() string {
+	var rows []string
+
+	header := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("VIRTUAL MOUSE & TRACKPAD CONTROLLER")
+	sub := lipgloss.NewStyle().Foreground(ColorTextDim).Render("Control remote host cursor directly via ESP32-S3 -> ESP-NOW -> Cardputer")
+	rows = append(rows, header, sub, "")
+
+	controls := lipgloss.JoinVertical(lipgloss.Left,
+		lipgloss.JoinHorizontal(lipgloss.Left, lipgloss.NewStyle().Bold(true).Foreground(ColorYellow).Render("Movement:  "), lipgloss.NewStyle().Foreground(ColorText).Render("[Arrow Keys] or [H, J, K, L] (Hold Alt for Turbo 3x)")),
+		lipgloss.JoinHorizontal(lipgloss.Left, lipgloss.NewStyle().Bold(true).Foreground(ColorGreen).Render("Clicks:    "), lipgloss.NewStyle().Foreground(ColorText).Render("[Space / Enter] Left Click  |  [r] Right Click  |  [m] Middle Click")),
+		lipgloss.JoinHorizontal(lipgloss.Left, lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("Scroll:    "), lipgloss.NewStyle().Foreground(ColorText).Render("[w] Scroll Up  |  [s] Scroll Down")),
+	)
+	rows = append(rows, controls, "")
+
+	lastMove := fmt.Sprintf("Last Motion: dX=%d, dY=%d | Status: %s", m.lastMouseDX, m.lastMouseDY, m.lastActionStatus)
+	rows = append(rows, lipgloss.NewStyle().Foreground(ColorPrimary).Render(lastMove))
+
+	return CardBox.Width(76).Render(strings.Join(rows, "\n"))
 }
 
 func (m Model) renderMacrosView() string {
@@ -471,7 +571,7 @@ func (m Model) renderMacrosView() string {
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, btn1, "   ", btn2))
 	}
 
-	return CardBox.Width(74).Render(strings.Join(rows, "\n"))
+	return CardBox.Width(76).Render(strings.Join(rows, "\n"))
 }
 
 func (m Model) renderMacroButton(item MacroItem) string {
@@ -489,7 +589,7 @@ func (m Model) renderMacroButton(item MacroItem) string {
 		BorderForeground(ColorBorder).
 		Background(ColorCardAlt).
 		Padding(0, 1).
-		Width(34).
+		Width(35).
 		Render(content)
 }
 
@@ -497,7 +597,7 @@ func (m Model) renderInjectorView() string {
 	var rows []string
 
 	header := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("FAST STRING & SCRIPT INJECTOR")
-	sub := lipgloss.NewStyle().Foreground(ColorTextDim).Render("Streams typed or pasted text directly to the host PC via Cardputer HID injector.")
+	sub := lipgloss.NewStyle().Foreground(ColorTextDim).Render("Streams typed or pasted text directly to the host PC via Transmitter Serial dongle.")
 	rows = append(rows, header, sub, "")
 
 	rows = append(rows, m.textInput.View(), "")
@@ -509,7 +609,7 @@ func (m Model) renderInjectorView() string {
 		rows = append(rows, lipgloss.NewStyle().Bold(true).Foreground(ColorGreen).Render("⚡ Injecting keystrokes..."))
 	}
 
-	return CardBox.Width(74).Render(strings.Join(rows, "\n"))
+	return CardBox.Width(76).Render(strings.Join(rows, "\n"))
 }
 
 func (m Model) renderTelemetryView() string {
@@ -521,18 +621,19 @@ func (m Model) renderTelemetryView() string {
 	stats := m.trans.Stats()
 
 	rows = append(rows,
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Target Receiver:"), StatValue.Render(m.trans.Endpoint())),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Link Protocol:"), StatValue.Render("UDP (802.11 b/g/n)")),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Transport Type:"), StatValue.Render(m.trans.Type())),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Target Port:"), StatValue.Render(m.trans.Endpoint())),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Wireless Link:"), StatValue.Render("ESP-NOW Channel 1 (Broadcast)")),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Packets Sent:"), StatValue.Render(fmt.Sprintf("%d", stats.PacketsSent))),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Payload Volume:"), StatValue.Render(fmt.Sprintf("%d bytes", stats.BytesSent))),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Transport Latency:"), StatValue.Render(stats.Latency.String())),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Socket Errors:"), StatValue.Render(fmt.Sprintf("%d", stats.Errors))),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Socket/IO Errors:"), StatValue.Render(fmt.Sprintf("%d", stats.Errors))),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Last Packet:"), StatValue.Render(stats.LastSent.Format("15:04:05.000"))),
 		"",
 		lipgloss.NewStyle().Foreground(ColorYellow).Render("Press [p] to send manual Heartbeat Ping"),
 	)
 
-	return CardBox.Width(74).Render(strings.Join(rows, "\n"))
+	return CardBox.Width(76).Render(strings.Join(rows, "\n"))
 }
 
 func (m Model) renderActivityLog() string {
@@ -543,21 +644,21 @@ func (m Model) renderActivityLog() string {
 		lines = append(lines, lipgloss.NewStyle().Foreground(ColorTextDim).Render(log))
 	}
 
-	return CardBox.Width(74).Render(strings.Join(lines, "\n"))
+	return CardBox.Width(76).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderFooter() string {
-	if m.captureActive {
+	if m.captureActive && m.activeTab == TabLiveCapture {
 		return lipgloss.JoinHorizontal(lipgloss.Left,
-			FooterKey.Render("[Esc] / [Ctrl+Q]"), FooterDesc.Render(" Release Capture"),
-			FooterKey.Render("[All Keys]"), FooterDesc.Render(" Transmitted to Host PC"),
+			FooterKey.Render("[Esc] / [Ctrl+Q]"), FooterDesc.Render(" Pause Capture"),
+			FooterKey.Render("[All Keys]"), FooterDesc.Render(" Transmitted to Remote Host"),
 		)
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Left,
 		FooterKey.Render("[Tab]"), FooterDesc.Render(" Switch Mode"),
 		FooterKey.Render("[Space]"), FooterDesc.Render(" Resume Capture"),
-		FooterKey.Render("[1-4]"), FooterDesc.Render(" Quick Tab"),
+		FooterKey.Render("[1-5]"), FooterDesc.Render(" Quick Tab"),
 		FooterKey.Render("[q]"), FooterDesc.Render(" Quit"),
 	)
 }

@@ -3,8 +3,11 @@ package transport
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
+
+	"go.bug.st/serial"
 
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/protocol"
 )
@@ -18,21 +21,220 @@ type TransportStats struct {
 	Latency     time.Duration
 }
 
-// Transport abstracts network and hardware communication
+// Transport abstracts physical wire and wireless network communication
 type Transport interface {
 	Send(data []byte) error
 	SendKey(modifier byte, keycode byte) error
 	SendReport(modifier byte, keycodes [6]byte) error
 	SendRelease() error
+	SendMouse(buttons byte, dx, dy, wheel int8) error
 	SendHeartbeat() error
 	SendString(s string, charDelay time.Duration) error
 	Close() error
 	IsConnected() bool
 	Stats() TransportStats
 	Endpoint() string
+	Type() string
 }
 
-// UDPTransport implements Transport over UDP to Cardputer-ADV
+// =====================================================================
+// Serial Dongle Transport (Primary Mode: PC -> ESP32-S3 via USB Cable)
+// =====================================================================
+
+type SerialTransport struct {
+	portName  string
+	baudRate  int
+	port      serial.Port
+	seq       uint16
+	stats     TransportStats
+	mu        sync.Mutex
+	connected bool
+}
+
+// AutoDetectSerialPort scans for connected USB-to-UART or USB CDC devices
+func AutoDetectSerialPort() (string, error) {
+	ports, err := serial.GetPortsList()
+	if err != nil {
+		return "", fmt.Errorf("failed to enumerate serial ports: %w", err)
+	}
+
+	if len(ports) == 0 {
+		return "", fmt.Errorf("no serial devices found. Plug in the ESP32-S3 transmitter via USB")
+	}
+
+	// 1. Prefer /dev/ttyUSB* (CH340 / CP2102)
+	for _, p := range ports {
+		if strings.Contains(p, "ttyUSB") {
+			return p, nil
+		}
+	}
+
+	// 2. Prefer /dev/ttyACM* (Native ESP32-S3 USB CDC)
+	for _, p := range ports {
+		if strings.Contains(p, "ttyACM") {
+			return p, nil
+		}
+	}
+
+	// 3. Fallback to first port
+	return ports[0], nil
+}
+
+// NewSerialTransport connects to the ESP32-S3 transmitter dongle via USB cable
+func NewSerialTransport(portName string, baudRate int) (*SerialTransport, error) {
+	if portName == "" {
+		detected, err := AutoDetectSerialPort()
+		if err != nil {
+			return nil, err
+		}
+		portName = detected
+	}
+
+	mode := &serial.Mode{
+		BaudRate: baudRate,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+
+	p, err := serial.Open(portName, mode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open serial port %s: %w", portName, err)
+	}
+
+	return &SerialTransport{
+		portName:  portName,
+		baudRate:  baudRate,
+		port:      p,
+		connected: true,
+	}, nil
+}
+
+func (s *SerialTransport) Send(data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.port == nil || !s.connected {
+		return fmt.Errorf("serial port %s not connected", s.portName)
+	}
+
+	start := time.Now()
+	n, err := s.port.Write(data)
+	if err != nil {
+		s.stats.Errors++
+		return err
+	}
+
+	s.stats.PacketsSent++
+	s.stats.BytesSent += uint64(n)
+	s.stats.LastSent = time.Now()
+	s.stats.Latency = time.Since(start)
+	return nil
+}
+
+func (s *SerialTransport) SendKey(modifier byte, keycode byte) error {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	pkt := protocol.EncodeSingleKey(modifier, keycode, seq)
+	if err := s.Send(pkt); err != nil {
+		return err
+	}
+
+	time.Sleep(15 * time.Millisecond)
+	return s.SendRelease()
+}
+
+func (s *SerialTransport) SendReport(modifier byte, keycodes [6]byte) error {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	pkt := protocol.EncodeKeyPacket(modifier, keycodes, seq)
+	return s.Send(pkt)
+}
+
+func (s *SerialTransport) SendRelease() error {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	pkt := protocol.EncodeRelease(seq)
+	return s.Send(pkt)
+}
+
+func (s *SerialTransport) SendMouse(buttons byte, dx, dy, wheel int8) error {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	pkt := protocol.EncodeMousePacket(buttons, dx, dy, wheel, seq)
+	return s.Send(pkt)
+}
+
+func (s *SerialTransport) SendHeartbeat() error {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	uptime := uint32(time.Now().UnixMilli())
+	s.mu.Unlock()
+
+	pkt := protocol.EncodeHeartbeat(uptime, seq)
+	return s.Send(pkt)
+}
+
+func (s *SerialTransport) SendString(text string, charDelay time.Duration) error {
+	for _, ch := range text {
+		mod, code := protocol.CharToHID(ch)
+		if code != protocol.KeyNone {
+			if err := s.SendKey(mod, code); err != nil {
+				return err
+			}
+			time.Sleep(charDelay)
+		}
+	}
+	return nil
+}
+
+func (s *SerialTransport) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connected = false
+	if s.port != nil {
+		return s.port.Close()
+	}
+	return nil
+}
+
+func (s *SerialTransport) IsConnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connected
+}
+
+func (s *SerialTransport) Stats() TransportStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats
+}
+
+func (s *SerialTransport) Endpoint() string {
+	return fmt.Sprintf("%s @ %d baud", s.portName, s.baudRate)
+}
+
+func (s *SerialTransport) Type() string {
+	return "Serial Dongle"
+}
+
+// =====================================================================
+// UDP Transport (Secondary Mode: Direct Wi-Fi)
+// =====================================================================
+
 type UDPTransport struct {
 	targetAddr string
 	conn       *net.UDPConn
@@ -43,7 +245,6 @@ type UDPTransport struct {
 	connected  bool
 }
 
-// NewUDPTransport creates a new UDP sender targeting targetAddr (e.g., "192.168.4.1:8888")
 func NewUDPTransport(targetAddr string) (*UDPTransport, error) {
 	raddr, err := net.ResolveUDPAddr("udp4", targetAddr)
 	if err != nil {
@@ -63,7 +264,6 @@ func NewUDPTransport(targetAddr string) (*UDPTransport, error) {
 	}, nil
 }
 
-// Send transmits raw bytes over UDP
 func (t *UDPTransport) Send(data []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -86,7 +286,6 @@ func (t *UDPTransport) Send(data []byte) error {
 	return nil
 }
 
-// SendKey transmits a single key press and schedules release
 func (t *UDPTransport) SendKey(modifier byte, keycode byte) error {
 	t.mu.Lock()
 	t.seq++
@@ -98,12 +297,10 @@ func (t *UDPTransport) SendKey(modifier byte, keycode byte) error {
 		return err
 	}
 
-	// Immediate or micro-delayed release
 	time.Sleep(15 * time.Millisecond)
 	return t.SendRelease()
 }
 
-// SendReport sends a multi-key 6KRO report (for key combinations or hold states)
 func (t *UDPTransport) SendReport(modifier byte, keycodes [6]byte) error {
 	t.mu.Lock()
 	t.seq++
@@ -114,7 +311,6 @@ func (t *UDPTransport) SendReport(modifier byte, keycodes [6]byte) error {
 	return t.Send(pkt)
 }
 
-// SendRelease sends an all-keys-up report
 func (t *UDPTransport) SendRelease() error {
 	t.mu.Lock()
 	t.seq++
@@ -125,7 +321,16 @@ func (t *UDPTransport) SendRelease() error {
 	return t.Send(pkt)
 }
 
-// SendHeartbeat sends a ping packet to keep link active
+func (t *UDPTransport) SendMouse(buttons byte, dx, dy, wheel int8) error {
+	t.mu.Lock()
+	t.seq++
+	seq := t.seq
+	t.mu.Unlock()
+
+	pkt := protocol.EncodeMousePacket(buttons, dx, dy, wheel, seq)
+	return t.Send(pkt)
+}
+
 func (t *UDPTransport) SendHeartbeat() error {
 	t.mu.Lock()
 	t.seq++
@@ -137,7 +342,6 @@ func (t *UDPTransport) SendHeartbeat() error {
 	return t.Send(pkt)
 }
 
-// SendString streams a string character by character with configurable delay
 func (t *UDPTransport) SendString(s string, charDelay time.Duration) error {
 	for _, ch := range s {
 		mod, code := protocol.CharToHID(ch)
@@ -151,7 +355,6 @@ func (t *UDPTransport) SendString(s string, charDelay time.Duration) error {
 	return nil
 }
 
-// Close closes the UDP socket
 func (t *UDPTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -162,21 +365,22 @@ func (t *UDPTransport) Close() error {
 	return nil
 }
 
-// IsConnected checks if transport is active
 func (t *UDPTransport) IsConnected() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.connected
 }
 
-// Stats returns current statistics
 func (t *UDPTransport) Stats() TransportStats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.stats
 }
 
-// Endpoint returns the target address
 func (t *UDPTransport) Endpoint() string {
 	return t.targetAddr
+}
+
+func (t *UDPTransport) Type() string {
+	return "Wi-Fi (UDP)"
 }

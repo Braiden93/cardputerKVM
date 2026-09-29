@@ -20,6 +20,17 @@ typedef struct __attribute__((packed)) {
     uint16_t seq_num;       // Sequence number
 } kvm_key_packet_t;
 
+// Mouse Movement & Click Packet
+typedef struct __attribute__((packed)) {
+    uint16_t magic;         // KVM_ESPNOW_MAGIC (0x4B56)
+    uint8_t  pkt_type;      // KVM_PKT_MOUSE_MOVE (0x02)
+    uint8_t  buttons;       // Bitmask: Bit 0 = Left, Bit 1 = Right, Bit 2 = Middle
+    int8_t   dx;            // X displacement (-127 to 127)
+    int8_t   dy;            // Y displacement (-127 to 127)
+    int8_t   wheel;         // Vertical scroll (-127 to 127)
+    uint16_t seq_num;       // Sequence number
+} kvm_mouse_packet_t;
+
 // Heartbeat Packet
 typedef struct __attribute__((packed)) {
     uint16_t magic;         // KVM_ESPNOW_MAGIC

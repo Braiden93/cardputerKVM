@@ -108,6 +108,16 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
         ESP_LOGI(TAG, "[%s] Key: Mod=0x%02X Key=0x%02X",
                  source_tag, pkt->modifiers, pkt->keycodes[0]);
     }
+    else if (pkt_type == KVM_PKT_MOUSE_MOVE && len >= sizeof(kvm_mouse_packet_t)) {
+        const kvm_mouse_packet_t *pkt = (const kvm_mouse_packet_t*)data;
+        if (tusb_hid_device_helper_is_mounted()) {
+            tusb_hid_device_helper_mouse_report(pkt->buttons, pkt->dx, pkt->dy, pkt->wheel);
+        }
+        last_key_name = "Mouse";
+        key_count++;
+        ESP_LOGD(TAG, "[%s] Mouse: Btn=0x%02X dX=%d dY=%d Wheel=%d",
+                 source_tag, pkt->buttons, pkt->dx, pkt->dy, pkt->wheel);
+    }
     else if (pkt_type == KVM_PKT_HEARTBEAT) {
         ESP_LOGD(TAG, "[%s] Heartbeat received", source_tag);
     }

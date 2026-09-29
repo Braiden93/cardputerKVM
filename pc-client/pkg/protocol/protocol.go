@@ -118,12 +118,44 @@ type KeyPacket struct {
 	SeqNum    uint16   // Sequence counter
 }
 
+// MousePacket represents the 9-byte wire format matching kvm_mouse_packet_t
+type MousePacket struct {
+	Magic   uint16 // 0x4B56
+	PktType uint8  // 0x02
+	Buttons uint8  // Bitmask: Bit 0=Left, Bit 1=Right, Bit 2=Middle
+	DX      int8   // X displacement (-127 to 127)
+	DY      int8   // Y displacement (-127 to 127)
+	Wheel   int8   // Vertical scroll (-127 to 127)
+	SeqNum  uint16
+}
+
+// Mouse Buttons
+const (
+	MouseBtnNone   = byte(0x00)
+	MouseBtnLeft   = byte(0x01)
+	MouseBtnRight  = byte(0x02)
+	MouseBtnMiddle = byte(0x04)
+)
+
 // HeartbeatPacket represents the 9-byte wire format matching kvm_heartbeat_packet_t
 type HeartbeatPacket struct {
 	Magic    uint16 // 0x4B56
 	PktType  uint8  // 0x03
 	UptimeMs uint32 // Client uptime or timestamp
 	SeqNum   uint16
+}
+
+// EncodeMousePacket serializes a relative mouse motion/click report into 9 bytes
+func EncodeMousePacket(buttons byte, dx, dy, wheel int8, seq uint16) []byte {
+	buf := make([]byte, 9)
+	binary.LittleEndian.PutUint16(buf[0:2], Magic)
+	buf[2] = PktTypeMouseMove
+	buf[3] = buttons
+	buf[4] = byte(dx)
+	buf[5] = byte(dy)
+	buf[6] = byte(wheel)
+	binary.LittleEndian.PutUint16(buf[7:9], seq)
+	return buf
 }
 
 // EncodeKeyPacket serializes a 6KRO keyboard report into 12 bytes

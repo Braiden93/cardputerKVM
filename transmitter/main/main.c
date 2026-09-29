@@ -20,6 +20,7 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -186,22 +187,81 @@ static void heartbeat_task(void *pvParameters)
     }
 }
 
-// Interactive Serial Console task: type in terminal -> beams wirelessly to Cardputer
-static void serial_input_task(void *pvParameters)
+#define UART_PORT UART_NUM_0
+#define UART_BUF_SIZE 512
+
+static void init_uart()
 {
-    ESP_LOGI(TAG, "=================================================");
-    ESP_LOGI(TAG, "  Interactive Wireless Keyboard Console Ready!   ");
-    ESP_LOGI(TAG, "  Type characters below to send to Cardputer PC  ");
-    ESP_LOGI(TAG, "=================================================");
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(UART_PORT, UART_BUF_SIZE * 2, 0, 0, NULL, 0);
+    uart_param_config(UART_PORT, &uart_config);
+}
+
+// High-speed Serial Bridge: PC Client (Serial) -> ESP-NOW -> Cardputer Receiver
+static void serial_bridge_task(void *pvParameters)
+{
+    uint8_t rx_buf[256];
+    size_t rx_len = 0;
+
+    ESP_LOGI(TAG, "Serial KVM Bridge active on UART0 (115200 baud)");
 
     while (1) {
-        int c = fgetc(stdin);
-        if (c != EOF && c > 0) {
-            printf("%c", (char)c);
-            fflush(stdout);
-            send_ascii_char((char)c);
+        int len = uart_read_bytes(UART_PORT, rx_buf + rx_len, sizeof(rx_buf) - rx_len, pdMS_TO_TICKS(10));
+        if (len > 0) {
+            rx_len += len;
+
+            while (rx_len >= 2) {
+                uint16_t magic = *(uint16_t*)rx_buf;
+                if (magic == KVM_ESPNOW_MAGIC) {
+                    if (rx_len < 3) break;
+                    uint8_t pkt_type = rx_buf[2];
+                    size_t pkt_size = 0;
+
+                    if (pkt_type == KVM_PKT_KEY_REPORT) {
+                        pkt_size = sizeof(kvm_key_packet_t);
+                    } else if (pkt_type == KVM_PKT_MOUSE_MOVE) {
+                        pkt_size = sizeof(kvm_mouse_packet_t);
+                    } else if (pkt_type == KVM_PKT_HEARTBEAT) {
+                        pkt_size = sizeof(kvm_heartbeat_packet_t);
+                    } else {
+                        // Unknown packet type, discard 1 byte to realign
+                        rx_len--;
+                        memmove(rx_buf, rx_buf + 1, rx_len);
+                        continue;
+                    }
+
+                    if (rx_len < pkt_size) {
+                        // Wait for complete frame
+                        break;
+                    }
+
+                    // Beam packet immediately over ESP-NOW!
+                    send_raw_packet(rx_buf, pkt_size);
+
+                    rx_len -= pkt_size;
+                    if (rx_len > 0) {
+                        memmove(rx_buf, rx_buf + pkt_size, rx_len);
+                    }
+                } else {
+                    // Raw ASCII typing fallback (e.g. typing in terminal)
+                    char c = (char)rx_buf[0];
+                    if (c > 0) {
+                        send_ascii_char(c);
+                    }
+                    rx_len--;
+                    if (rx_len > 0) {
+                        memmove(rx_buf, rx_buf + 1, rx_len);
+                    }
+                }
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -248,7 +308,10 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "=== Cardputer-KVM Transmitter (ESP32-S3 N16R8) ===");
 
-    // 1. Configure BOOT Button (GPIO 0)
+    // 1. Initialize UART0 Serial Bridge
+    init_uart();
+
+    // 2. Configure BOOT Button (GPIO 0)
     const gpio_config_t btn_cfg = {
         .pin_bit_mask = BIT64(BOOT_BUTTON_PIN),
         .mode = GPIO_MODE_INPUT,
@@ -258,14 +321,14 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(gpio_config(&btn_cfg));
 
-    // 2. Initialize ESP-NOW
+    // 3. Initialize ESP-NOW
     init_espnow_transmitter();
 
-    // 3. Start Heartbeat & Console Tasks
+    // 4. Start Heartbeat & Serial Bridge Tasks
     xTaskCreate(heartbeat_task, "kvm_heartbeat", 3072, NULL, 5, NULL);
-    xTaskCreate(serial_input_task, "kvm_console", 4096, NULL, 5, NULL);
+    xTaskCreate(serial_bridge_task, "kvm_serial_bridge", 4096, NULL, 5, NULL);
 
-    // 4. Main Button Polling Loop
+    // 5. Main Button Polling Loop
     bool last_btn_state = true;
 
     while (1) {

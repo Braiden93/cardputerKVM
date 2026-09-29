@@ -226,6 +226,11 @@ void tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
     tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, modifier, keycode);
 }
 
+void tusb_hid_device_helper_mouse_report(uint8_t buttons, int8_t x, int8_t y, int8_t vertical)
+{
+    tud_hid_mouse_report(HID_ITF_PROTOCOL_MOUSE, buttons, x, y, vertical, 0);
+}
+
 bool tusb_hid_device_helper_is_mounted(void)
 {
     return tud_mounted();

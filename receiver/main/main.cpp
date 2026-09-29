@@ -42,6 +42,26 @@ static char remote_mac_str[18] = "None";
 static uint32_t last_remote_packet_time = 0;
 static bool remote_linked = false;
 
+// Live Input Activity & Visual Feedback Tracking
+static uint32_t last_kbd_event_time = 0;
+static uint8_t  last_kbd_mod = 0;
+static bool     last_kbd_is_local = false;
+
+static uint32_t last_mouse_event_time = 0;
+static uint32_t last_mouse_move_time = 0;
+static uint32_t last_mouse_click_time = 0;
+static uint32_t last_mouse_wheel_time = 0;
+static int32_t  live_display_mouse_dx = 0;
+static int32_t  live_display_mouse_dy = 0;
+static int32_t  live_display_mouse_wheel = 0;
+static uint8_t  live_display_mouse_buttons = 0;
+static uint8_t  last_clicked_buttons = 0;
+static uint32_t total_mouse_packets = 0;
+
+// Offscreen Canvas for Tear-Free 25FPS Rendering
+static M5Canvas s_canvas(&M5.Display);
+static bool s_has_canvas = false;
+
 // Forward declarations
 static void process_kvm_packet(const uint8_t *data, int len, const char *source_tag);
 static void update_display(bool force = false);
@@ -77,6 +97,78 @@ static kvm_mouse_state_t s_mouse_state = {
     .mux = portMUX_INITIALIZER_UNLOCKED
 };
 
+static std::string get_key_display_string(uint8_t mod, uint8_t code)
+{
+    std::string s = "";
+    if (mod & 0x11) s += "Ctrl+";
+    if (mod & 0x22) s += "Shift+";
+    if (mod & 0x44) s += "Alt+";
+    if (mod & 0x88) s += "Win+";
+
+    if (code >= 0x04 && code <= 0x1D) {
+        char ch = 'A' + (code - 0x04);
+        s += ch;
+    } else if (code >= 0x1E && code <= 0x26) {
+        char ch = '1' + (code - 0x1E);
+        s += ch;
+    } else if (code == 0x27) {
+        s += "0";
+    } else if (code == 0x28) {
+        s += "Enter";
+    } else if (code == 0x29) {
+        s += "Esc";
+    } else if (code == 0x2A) {
+        s += "Bksp";
+    } else if (code == 0x2B) {
+        s += "Tab";
+    } else if (code == 0x2C) {
+        s += "Space";
+    } else if (code == 0x2D) {
+        s += "-";
+    } else if (code == 0x2E) {
+        s += "=";
+    } else if (code == 0x2F) {
+        s += "[";
+    } else if (code == 0x30) {
+        s += "]";
+    } else if (code == 0x31) {
+        s += "\\";
+    } else if (code == 0x33) {
+        s += ";";
+    } else if (code == 0x34) {
+        s += "'";
+    } else if (code == 0x36) {
+        s += ",";
+    } else if (code == 0x37) {
+        s += ".";
+    } else if (code == 0x38) {
+        s += "/";
+    } else if (code >= 0x3A && code <= 0x45) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "F%d", code - 0x3A + 1);
+        s += buf;
+    } else if (code == 0x4F) {
+        s += "Right";
+    } else if (code == 0x50) {
+        s += "Left";
+    } else if (code == 0x51) {
+        s += "Down";
+    } else if (code == 0x52) {
+        s += "Up";
+    } else if (code != 0) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "0x%02X", code);
+        s += buf;
+    } else if (s.empty()) {
+        s = "None";
+    } else {
+        if (!s.empty() && s.back() == '+') {
+            s.pop_back();
+        }
+    }
+    return s;
+}
+
 static void kvm_dispatcher_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Phase-Locked 1000Hz KVM USB Dispatcher Task started.");
@@ -102,9 +194,18 @@ static void kvm_dispatcher_task(void *pvParameters)
                 uint8_t *keys = has_key ? evt.keycodes : NULL;
                 tusb_hid_device_helper_report(evt.modifiers, keys);
 
-                last_key_code = evt.keycodes[0];
-                last_key_name = has_key ? "Remote Key" : "Released";
-                key_count++;
+                if (has_key || evt.modifiers != 0) {
+                    last_kbd_event_time = esp_log_timestamp();
+                    last_kbd_is_local = false;
+                    last_key_code = evt.keycodes[0];
+                    last_kbd_mod = evt.modifiers;
+                    last_key_name = get_key_display_string(evt.modifiers, evt.keycodes[0]);
+                    key_count++;
+                } else {
+                    last_key_name = "None";
+                    last_key_code = 0;
+                    last_kbd_mod = 0;
+                }
             }
         }
 
@@ -136,7 +237,6 @@ static void kvm_dispatcher_task(void *pvParameters)
                     portEXIT_CRITICAL(&s_mouse_state.mux);
 
                     tusb_hid_device_helper_mouse_report_nowait(m_buttons, send_dx, send_dy, send_wheel);
-                    last_key_name = "Mouse";
                     key_count++;
 
                     // Sent 1 frame: USB endpoint is now busy for 1ms SOF
@@ -164,7 +264,8 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
     uint16_t magic = *(uint16_t*)data;
     if (magic != KVM_ESPNOW_MAGIC) return;
 
-    last_remote_packet_time = esp_log_timestamp();
+    uint32_t now = esp_log_timestamp();
+    last_remote_packet_time = now;
     remote_linked = true;
 
     uint8_t pkt_type = data[2];
@@ -182,6 +283,24 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
     }
     else if (pkt_type == KVM_PKT_MOUSE_MOVE && len >= sizeof(kvm_mouse_packet_t)) {
         const kvm_mouse_packet_t *pkt = (const kvm_mouse_packet_t*)data;
+        last_mouse_event_time = now;
+        total_mouse_packets++;
+
+        if (pkt->dx != 0 || pkt->dy != 0) {
+            last_mouse_move_time = now;
+            live_display_mouse_dx = pkt->dx;
+            live_display_mouse_dy = pkt->dy;
+        }
+        if (pkt->wheel != 0) {
+            last_mouse_wheel_time = now;
+            live_display_mouse_wheel = pkt->wheel;
+        }
+        if (pkt->buttons != 0) {
+            last_mouse_click_time = now;
+            last_clicked_buttons |= pkt->buttons;
+        }
+        live_display_mouse_buttons = pkt->buttons;
+
         portENTER_CRITICAL(&s_mouse_state.mux);
         s_mouse_state.dx += pkt->dx;
         s_mouse_state.dy += pkt->dy;
@@ -235,84 +354,302 @@ static void init_espnow_receiver()
     ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, 24M PHY, No AP)", KVM_ESPNOW_CHANNEL);
 }
 
+// -------------------------------------------------------------
+// Visual Icon & Card Renderers
+// -------------------------------------------------------------
+
+static void draw_usb_icon(LovyanGFX &gfx, int x, int y, bool connected)
+{
+    uint16_t col = connected ? 0x07E0 : 0xF800; // Bright Green : Red
+
+    // Central trunk
+    gfx.drawFastVLine(x + 5, y + 2, 9, col);
+
+    // Top arrow (pointing up)
+    gfx.drawPixel(x + 5, y + 0, col);
+    gfx.drawFastHLine(x + 4, y + 1, 3, col);
+    gfx.drawFastHLine(x + 3, y + 2, 5, col);
+
+    // Left branch (square head)
+    gfx.drawLine(x + 5, y + 6, x + 2, y + 4, col);
+    gfx.drawFastVLine(x + 2, y + 2, 2, col);
+    gfx.fillRect(x + 1, y + 1, 3, 3, col);
+
+    // Right branch (circle head)
+    gfx.drawLine(x + 5, y + 7, x + 8, y + 5, col);
+    gfx.drawFastVLine(x + 8, y + 3, 2, col);
+    gfx.fillCircle(x + 8, y + 2, 1, col);
+
+    // Bottom base circle
+    gfx.fillCircle(x + 5, y + 11, 2, col);
+
+    // Text status badge
+    gfx.setTextColor(col, 0x10A2);
+    gfx.drawString(connected ? "USB" : "NO USB", x + 14, y + 3);
+}
+
+static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked)
+{
+    uint16_t col = linked ? 0x07FF : 0x7BEF; // Neon Cyan : Slate Gray
+
+    // Central antenna mast
+    gfx.drawFastVLine(x + 6, y + 6, 6, col);
+    gfx.fillCircle(x + 6, y + 5, 2, col);
+
+    // Inner radiating waves
+    gfx.drawPixel(x + 3, y + 3, col);
+    gfx.drawPixel(x + 4, y + 2, col);
+    gfx.drawFastHLine(x + 5, y + 1, 3, col);
+    gfx.drawPixel(x + 8, y + 2, col);
+    gfx.drawPixel(x + 9, y + 3, col);
+
+    // Outer radiating waves
+    gfx.drawPixel(x + 0, y + 3, col);
+    gfx.drawPixel(x + 1, y + 1, col);
+    gfx.drawFastHLine(x + 3, y - 1, 7, col);
+    gfx.drawPixel(x + 11, y + 1, col);
+    gfx.drawPixel(x + 12, y + 3, col);
+
+    // Text label
+    gfx.setTextColor(col, 0x10A2);
+    gfx.drawString(linked ? "RF LINK" : "RF SCAN", x + 16, y + 3);
+}
+
+static void draw_battery_icon(LovyanGFX &gfx, int x, int y, int batt_level)
+{
+    if (batt_level < 0) batt_level = 0;
+    if (batt_level > 100) batt_level = 100;
+
+    // Body
+    gfx.drawRoundRect(x, y, 18, 10, 2, 0x7BEF);
+    // Terminal nub
+    gfx.fillRect(x + 18, y + 3, 2, 4, 0x7BEF);
+
+    // Color based on level
+    uint16_t col = (batt_level > 40) ? 0x07E0 : ((batt_level > 20) ? 0xFFE0 : 0xF800);
+    int fill_w = (batt_level * 14) / 100;
+    if (fill_w > 0) {
+        gfx.fillRect(x + 2, y + 2, fill_w, 6, col);
+    }
+
+    char batt_str[12];
+    snprintf(batt_str, sizeof(batt_str), "%d%%", batt_level);
+    gfx.setTextColor(TFT_WHITE, 0x10A2);
+    gfx.drawRightString(batt_str, x - 4, y + 1);
+}
+
+static void draw_keyboard_card(LovyanGFX &gfx, int x, int y, int w, int h, bool active,
+                               const std::string &key_name, uint8_t key_code, uint8_t mod)
+{
+    // Background card panel
+    gfx.fillRoundRect(x, y, w, h, 4, 0x0842);
+    gfx.drawRoundRect(x, y, w, h, 4, active ? 0xFFE0 : 0x2965);
+
+    // Header label & status dot
+    gfx.setTextColor(active ? 0xFFE0 : 0x7BEF, 0x0842);
+    gfx.drawString("KEYBOARD", x + 8, y + 5);
+    gfx.fillCircle(x + w - 10, y + 8, 3, active ? 0xFFE0 : 0x31A6);
+
+    // Keyboard chassis
+    int kx = x + 16, ky = y + 17;
+    gfx.fillRoundRect(kx, ky, 82, 34, 3, active ? 0x2104 : 0x10A2);
+    gfx.drawRoundRect(kx, ky, 82, 34, 3, active ? 0xFFE0 : 0x4208);
+
+    uint16_t key_col = active ? 0xFFE0 : 0x4A69;
+
+    // Row 1 (7 keys)
+    for (int i = 0; i < 7; i++) {
+        gfx.fillRect(kx + 4 + i * 11, ky + 3, 8, 5, key_col);
+    }
+    // Row 2 (7 keys)
+    for (int i = 0; i < 7; i++) {
+        gfx.fillRect(kx + 4 + i * 11, ky + 10, 8, 5, key_col);
+    }
+    // Row 3 (7 keys)
+    for (int i = 0; i < 7; i++) {
+        gfx.fillRect(kx + 4 + i * 11, ky + 17, 8, 5, key_col);
+    }
+    // Row 4: Modifiers + Spacebar
+    uint16_t mod_col = (active && mod != 0) ? 0xFFFF : key_col;
+    uint16_t space_col = (active && key_code == 0x2C) ? 0xFFFF : key_col;
+    gfx.fillRect(kx + 4, ky + 24, 12, 6, mod_col);
+    gfx.fillRect(kx + 20, ky + 24, 42, 6, space_col);
+    gfx.fillRect(kx + 66, ky + 24, 12, 6, mod_col);
+
+    // Key display pill
+    gfx.fillRoundRect(x + 6, y + 56, w - 12, 20, 3, 0x10A2);
+    gfx.drawRoundRect(x + 6, y + 56, w - 12, 20, 3, active ? 0xFFE0 : 0x2125);
+
+    gfx.setTextColor(active ? 0xFFFF : 0x07FF, 0x10A2);
+    gfx.drawCenterString(key_name.empty() ? "None" : key_name.c_str(), x + w / 2, y + 62);
+
+    // Scancode / info
+    if (key_code != 0) {
+        char code_str[16];
+        snprintf(code_str, sizeof(code_str), "HID: 0x%02X", key_code);
+        gfx.setTextColor(0x52AA, 0x0842);
+        gfx.drawCenterString(code_str, x + w / 2, y + 79);
+    } else {
+        gfx.setTextColor(0x52AA, 0x0842);
+        gfx.drawCenterString("IDLE", x + w / 2, y + 79);
+    }
+}
+
+static void draw_mouse_card(LovyanGFX &gfx, int x, int y, int w, int h,
+                            bool moving, bool left_click, bool right_click, bool mid_click,
+                            int32_t dx, int32_t dy, int32_t wheel)
+{
+    bool any_active = moving || left_click || right_click || mid_click;
+
+    // Background card panel
+    gfx.fillRoundRect(x, y, w, h, 4, 0x0842);
+    uint16_t border_col = (left_click || right_click) ? 0xF800 : (moving ? 0x07E0 : (mid_click ? 0x07FF : 0x2965));
+    gfx.drawRoundRect(x, y, w, h, 4, border_col);
+
+    // Header label & status dot
+    gfx.setTextColor(any_active ? border_col : 0x7BEF, 0x0842);
+    gfx.drawString("MOUSE", x + 8, y + 5);
+    gfx.fillCircle(x + w - 10, y + 8, 3, any_active ? border_col : 0x31A6);
+
+    // Mouse Graphic
+    int mx = x + 39, my = y + 17;
+
+    // Palm Rest (Lower Shell)
+    gfx.fillRoundRect(mx, my + 15, 36, 25, 7, moving ? 0x0320 : 0x10A2);
+    gfx.drawRoundRect(mx, my + 15, 36, 25, 7, moving ? 0x07E0 : 0x31A6);
+
+    if (moving) {
+        gfx.drawCircle(mx + 18, my + 27, 4, 0x07E0);
+        gfx.drawCircle(mx + 18, my + 27, 7, 0x04A0);
+    } else {
+        gfx.drawFastHLine(mx + 12, my + 28, 12, 0x2965);
+    }
+
+    // Left Button
+    int lb_x = mx, lb_y = my, lb_w = 16, lb_h = 16;
+    uint16_t lb_col = left_click ? 0xF800 : 0x18E3;
+    gfx.fillRoundRect(lb_x, lb_y, lb_w, lb_h, 3, lb_col);
+    gfx.drawRoundRect(lb_x, lb_y, lb_w, lb_h, 3, left_click ? 0xFFFF : 0x4208);
+    gfx.setTextColor(left_click ? 0xFFFF : 0x632C, lb_col);
+    gfx.drawString("L", lb_x + 5, lb_y + 4);
+
+    // Right Button
+    int rb_x = mx + 20, rb_y = my, rb_w = 16, rb_h = 16;
+    uint16_t rb_col = right_click ? 0xF800 : 0x18E3;
+    gfx.fillRoundRect(rb_x, rb_y, rb_w, rb_h, 3, rb_col);
+    gfx.drawRoundRect(rb_x, rb_y, rb_w, rb_h, 3, right_click ? 0xFFFF : 0x4208);
+    gfx.setTextColor(right_click ? 0xFFFF : 0x632C, rb_col);
+    gfx.drawString("R", rb_x + 6, rb_y + 4);
+
+    // Scroll Wheel
+    int mw_x = mx + 15, mw_y = my + 2, mw_w = 6, mw_h = 11;
+    uint16_t mw_col = mid_click ? 0x07FF : 0x39E7;
+    gfx.fillRoundRect(mw_x, mw_y, mw_w, mw_h, 2, mw_col);
+    gfx.drawRoundRect(mw_x, mw_y, mw_w, mw_h, 2, mid_click ? 0xFFFF : 0x632C);
+
+    // Directional Motion Indicator Arrows (▲, ▼, ◄, ►)
+    // UP Arrow
+    uint16_t up_col = (moving && dy < 0) ? 0x07E0 : 0x18C3;
+    gfx.fillTriangle(mx + 18, my - 5, mx + 15, my - 2, mx + 21, my - 2, up_col);
+    // DOWN Arrow
+    uint16_t down_col = (moving && dy > 0) ? 0x07E0 : 0x18C3;
+    gfx.fillTriangle(mx + 18, my + 44, mx + 15, my + 41, mx + 21, my + 41, down_col);
+    // LEFT Arrow
+    uint16_t left_arrow_col = (moving && dx < 0) ? 0x07E0 : 0x18C3;
+    gfx.fillTriangle(mx - 5, my + 24, mx - 2, my + 21, mx - 2, my + 27, left_arrow_col);
+    // RIGHT Arrow
+    uint16_t right_arrow_col = (moving && dx > 0) ? 0x07E0 : 0x18C3;
+    gfx.fillTriangle(mx + 41, my + 24, mx + 38, my + 21, mx + 38, my + 27, right_arrow_col);
+
+    // Readout Pill
+    gfx.fillRoundRect(x + 6, y + 56, w - 12, 32, 3, 0x10A2);
+    gfx.drawRoundRect(x + 6, y + 56, w - 12, 32, 3, border_col);
+
+    // Vector readout
+    char vec_str[32];
+    snprintf(vec_str, sizeof(vec_str), "dX:%+3d dY:%+3d", (int)dx, (int)dy);
+    gfx.setTextColor(moving ? 0x07E0 : 0x7BEF, 0x10A2);
+    gfx.drawCenterString(vec_str, x + w / 2, y + 60);
+
+    // Button states [L] [M] [R]
+    gfx.setTextColor(left_click ? 0xF800 : 0x4A69, 0x10A2);
+    gfx.drawString("[L]", x + 16, y + 74);
+
+    gfx.setTextColor(mid_click ? 0x07FF : 0x4A69, 0x10A2);
+    gfx.drawString("[M]", x + 48, y + 74);
+
+    gfx.setTextColor(right_click ? 0xF800 : 0x4A69, 0x10A2);
+    gfx.drawString("[R]", x + 80, y + 74);
+}
+
 static void update_display(bool force)
 {
-    static bool prev_mounted = false;
-    static bool prev_rf_linked = false;
-    static std::string prev_key = "";
-    static int prev_batt = -1;
+    uint32_t now = esp_log_timestamp();
 
     bool current_mounted = tusb_hid_device_helper_is_mounted();
     int current_batt = M5.Power.getBatteryLevel();
+    bool is_rf_alive = (now - last_remote_packet_time < 5000) && remote_linked;
 
-    // Check remote link timeout (5 seconds)
-    bool is_rf_alive = (esp_log_timestamp() - last_remote_packet_time < 5000) && remote_linked;
+    bool kbd_active = (now - last_kbd_event_time < 220);
+    bool mouse_moving = (now - last_mouse_move_time < 220);
+    bool left_clicked = (live_display_mouse_buttons & 0x01) ||
+                        ((last_clicked_buttons & 0x01) && (now - last_mouse_click_time < 220));
+    bool right_clicked = (live_display_mouse_buttons & 0x02) ||
+                         ((last_clicked_buttons & 0x02) && (now - last_mouse_click_time < 220));
+    bool mid_clicked = (live_display_mouse_buttons & 0x04) ||
+                        ((last_clicked_buttons & 0x04) && (now - last_mouse_click_time < 220)) ||
+                        (now - last_mouse_wheel_time < 220);
 
-    if (!force && prev_mounted == current_mounted && prev_rf_linked == is_rf_alive &&
-        prev_key == last_key_name && prev_batt == current_batt) {
-        return;
+    if (now - last_mouse_click_time > 220) {
+        last_clicked_buttons = live_display_mouse_buttons;
     }
 
-    prev_mounted = current_mounted;
-    prev_rf_linked = is_rf_alive;
-    prev_key = last_key_name;
-    prev_batt = current_batt;
+    LovyanGFX &gfx = s_has_canvas ? (LovyanGFX&)s_canvas : (LovyanGFX&)M5.Display;
 
-    M5.Display.startWrite();
+    if (!s_has_canvas) {
+        M5.Display.startWrite();
+    }
 
     // Top Header Bar
-    M5.Display.fillRect(0, 0, 240, 20, 0x10A2); // Dark blue header
-    M5.Display.setTextColor(TFT_WHITE, 0x10A2);
-    M5.Display.setTextSize(1);
-    M5.Display.drawString("Cardputer-ADV KVM", 6, 5);
+    gfx.fillRect(0, 0, 240, 20, 0x10A2); // Dark blue header
+    gfx.drawFastHLine(0, 20, 240, 0x2125);
 
-    char batt_str[16];
-    snprintf(batt_str, sizeof(batt_str), "%d%%", current_batt);
-    M5.Display.drawRightString(batt_str, 234, 5);
+    // USB Icon (x: 6, y: 4)
+    draw_usb_icon(gfx, 6, 4, current_mounted);
 
-    // USB Connection Status Banner
-    if (current_mounted) {
-        M5.Display.fillRect(6, 24, 228, 22, 0x03E0); // Green
-        M5.Display.setTextColor(TFT_WHITE, 0x03E0);
-        M5.Display.drawCenterString("USB: CONNECTED (Dell Wireless)", 120, 30);
+    // RF Icon (x: 76, y: 4)
+    draw_rf_icon(gfx, 76, 4, is_rf_alive);
+
+    // Battery Icon (x: 204, y: 5)
+    draw_battery_icon(gfx, 204, 5, current_batt);
+
+    // Main Card 1: KEYBOARD (x: 4, y: 23, w: 114, h: 93)
+    draw_keyboard_card(gfx, 4, 23, 114, 93, kbd_active, last_key_name, last_key_code, last_kbd_mod);
+
+    // Main Card 2: MOUSE (x: 122, y: 23, w: 114, h: 93)
+    int32_t show_dx = mouse_moving ? live_display_mouse_dx : 0;
+    int32_t show_dy = mouse_moving ? live_display_mouse_dy : 0;
+    int32_t show_wheel = (now - last_mouse_wheel_time < 220) ? live_display_mouse_wheel : 0;
+    draw_mouse_card(gfx, 122, 23, 114, 93, mouse_moving, left_clicked, right_clicked, mid_clicked,
+                    show_dx, show_dy, show_wheel);
+
+    // Bottom Status Bar (y: 118..134)
+    gfx.fillRect(0, 117, 240, 18, TFT_BLACK);
+    gfx.drawFastHLine(0, 117, 240, 0x2125);
+
+    char pkt_str[32];
+    snprintf(pkt_str, sizeof(pkt_str), "PKTS: %lu", (unsigned long)(key_count + total_mouse_packets));
+    gfx.setTextColor(0x07FF, TFT_BLACK);
+    gfx.drawString(pkt_str, 6, 122);
+
+    gfx.setTextColor(0x632C, TFT_BLACK);
+    gfx.drawRightString("Dell 413C:2501", 234, 122);
+
+    if (s_has_canvas) {
+        s_canvas.pushSprite(0, 0);
     } else {
-        M5.Display.fillRect(6, 24, 228, 22, 0x7800); // Dark red / orange
-        M5.Display.setTextColor(TFT_WHITE, 0x7800);
-        M5.Display.drawCenterString("USB: WAITING FOR HOST PC", 120, 30);
+        M5.Display.endWrite();
     }
-
-    // Wireless RF Link Banner
-    if (is_rf_alive) {
-        M5.Display.fillRect(6, 50, 228, 22, 0x0013); // Dark teal
-        M5.Display.setTextColor(0x07FF, 0x0013); // Cyan
-        char rf_str[48];
-        snprintf(rf_str, sizeof(rf_str), "RF: LINKED [%.8s...]", remote_mac_str);
-        M5.Display.drawCenterString(rf_str, 120, 56);
-    } else {
-        M5.Display.fillRect(6, 50, 228, 22, 0x2124); // Dark gray
-        M5.Display.setTextColor(TFT_YELLOW, 0x2124);
-        M5.Display.drawCenterString("RF: ESP-NOW CH 1 (LISTENING)", 120, 56);
-    }
-
-    // Keypress Display Box
-    M5.Display.fillRect(6, 76, 228, 38, 0x18E3); // Dark slate panel
-    M5.Display.drawRect(6, 76, 228, 38, 0x4A69);
-
-    M5.Display.setTextColor(TFT_WHITE, 0x18E3);
-    char key_info[64];
-    snprintf(key_info, sizeof(key_info), "Input: %-10s (0x%02X)", last_key_name.c_str(), last_key_code);
-    M5.Display.drawString(key_info, 12, 88);
-
-    char count_info[32];
-    snprintf(count_info, sizeof(count_info), "Sent: %lu", (unsigned long)key_count);
-    M5.Display.drawRightString(count_info, 226, 88);
-
-    // Bottom Help Line
-    M5.Display.fillRect(0, 118, 240, 17, TFT_BLACK);
-    M5.Display.setTextColor(0x07FF, TFT_BLACK); // Cyan
-    M5.Display.drawCenterString("ESP-NOW CH 1 | Pure RF Wireless", 120, 121);
-
-    M5.Display.endWrite();
 }
 
 extern "C" void app_main(void)
@@ -325,6 +662,13 @@ extern "C" void app_main(void)
     M5.Display.setRotation(1); // Landscape (240x135)
     M5.Display.setBrightness(120);
     M5.Display.fillScreen(TFT_BLACK);
+
+    if (s_canvas.createSprite(240, 135)) {
+        s_has_canvas = true;
+        ESP_LOGI(TAG, "M5Canvas 240x135 initialized successfully for tear-free rendering.");
+    } else {
+        ESP_LOGW(TAG, "M5Canvas allocation failed; using direct display rendering.");
+    }
 
     ESP_LOGI(TAG, "M5Unified initialized successfully.");
 
@@ -362,8 +706,11 @@ extern "C" void app_main(void)
                 tusb_hid_device_helper_report(mod, keycode);
             }
 
-            last_key_name = keyEvent.keyName ? keyEvent.keyName : "Special";
+            last_kbd_event_time = esp_log_timestamp();
+            last_kbd_is_local = true;
             last_key_code = keyEvent.keyCode;
+            last_kbd_mod = mod;
+            last_key_name = keyEvent.keyName ? keyEvent.keyName : get_key_display_string(mod, keyEvent.keyCode);
             key_count++;
 
             ESP_LOGI(TAG, "Local Key: %s (0x%02X) Mod: 0x%02X",
@@ -395,10 +742,16 @@ extern "C" void app_main(void)
             update_display(true);
         }
 
-        // Periodic UI refresh (5Hz, decoupled from USB dispatcher)
+        // Dynamic adaptive UI refresh (25Hz during motion/input, 5Hz when idle)
         static uint32_t last_ui_tick = 0;
         uint32_t now = esp_log_timestamp();
-        if (now - last_ui_tick > 200) {
+        bool is_animating = (now - last_kbd_event_time < 250) ||
+                            (now - last_mouse_move_time < 250) ||
+                            (now - last_mouse_click_time < 250) ||
+                            (now - last_mouse_wheel_time < 250);
+        uint32_t interval = is_animating ? 40 : 200;
+
+        if (now - last_ui_tick >= interval) {
             last_ui_tick = now;
             update_display();
         }
@@ -406,3 +759,4 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
+

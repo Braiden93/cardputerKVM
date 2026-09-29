@@ -94,7 +94,7 @@ static QueueHandle_t s_kvm_queue = NULL;
 static void kvm_dispatcher_task(void *pvParameters)
 {
     kvm_event_t evt;
-    ESP_LOGI(TAG, "KVM USB Dispatcher Task started.");
+    ESP_LOGI(TAG, "High-Priority KVM USB Dispatcher Task started.");
 
     while (1) {
         if (xQueueReceive(s_kvm_queue, &evt, portMAX_DELAY)) {
@@ -114,18 +114,36 @@ static void kvm_dispatcher_task(void *pvParameters)
                 last_key_code = evt.keycodes[0];
                 last_key_name = has_key ? "Remote Key" : "Released";
                 key_count++;
-                update_display();
-
-                ESP_LOGI(TAG, "[%s] Key: Mod=0x%02X Code=0x%02X (%s)",
-                         evt.source_tag, evt.modifiers, evt.keycodes[0], last_key_name.c_str());
             } else if (evt.pkt_type == KVM_PKT_MOUSE_MOVE) {
-                tusb_hid_device_helper_mouse_report(evt.buttons, evt.dx, evt.dy, evt.wheel);
+                // High-performance queue coalescing: merge any backlog of mouse deltas
+                int32_t total_dx = evt.dx;
+                int32_t total_dy = evt.dy;
+                int32_t total_wheel = evt.wheel;
+                uint8_t buttons = evt.buttons;
+
+                kvm_event_t next_evt;
+                while (xQueuePeek(s_kvm_queue, &next_evt, 0) == pdTRUE) {
+                    if (next_evt.pkt_type == KVM_PKT_MOUSE_MOVE) {
+                        xQueueReceive(s_kvm_queue, &next_evt, 0);
+                        total_dx += next_evt.dx;
+                        total_dy += next_evt.dy;
+                        total_wheel += next_evt.wheel;
+                        buttons = next_evt.buttons;
+                    } else {
+                        break; // Next item is a key event, preserve order
+                    }
+                }
+
+                if (total_dx > 127) total_dx = 127;
+                if (total_dx < -127) total_dx = -127;
+                if (total_dy > 127) total_dy = 127;
+                if (total_dy < -127) total_dy = -127;
+                if (total_wheel > 127) total_wheel = 127;
+                if (total_wheel < -127) total_wheel = -127;
+
+                tusb_hid_device_helper_mouse_report(buttons, (int8_t)total_dx, (int8_t)total_dy, (int8_t)total_wheel);
                 last_key_name = "Mouse";
                 key_count++;
-                update_display();
-
-                ESP_LOGD(TAG, "[%s] Mouse: Btn=0x%02X dX=%d dY=%d Wheel=%d",
-                         evt.source_tag, evt.buttons, evt.dx, evt.dy, evt.wheel);
             }
         }
     }
@@ -317,7 +335,7 @@ extern "C" void app_main(void)
 
     // 4. Create KVM USB Event Queue and Dispatcher Task
     s_kvm_queue = xQueueCreate(64, sizeof(kvm_event_t));
-    xTaskCreate(kvm_dispatcher_task, "kvm_disp", 4096, NULL, 10, NULL);
+    xTaskCreate(kvm_dispatcher_task, "kvm_disp", 4096, NULL, 15, NULL);
 
     // 5. Initialize Pure ESP-NOW Receiver
     init_espnow_receiver();
@@ -384,10 +402,10 @@ extern "C" void app_main(void)
             update_display(true);
         }
 
-        // Periodic UI refresh
+        // Periodic UI refresh (5Hz, decoupled from USB dispatcher)
         static uint32_t last_ui_tick = 0;
         uint32_t now = esp_log_timestamp();
-        if (now - last_ui_tick > 1000) {
+        if (now - last_ui_tick > 200) {
             last_ui_tick = now;
             update_display();
         }

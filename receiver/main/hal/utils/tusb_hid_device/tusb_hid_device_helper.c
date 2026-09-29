@@ -69,8 +69,8 @@ static const uint8_t hid_configuration_descriptor[] = {
     // Configuration number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
 
-    // Interface number, string index, boot protocol, report descriptor len, EP In address, size & polling interval
-    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 10),
+    // Interface number, string index, boot protocol, report descriptor len, EP In address, size & polling interval (1ms = 1000Hz gaming-grade polling)
+    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 1),
 };
 
 /********* TinyUSB HID callbacks ***************/
@@ -229,7 +229,7 @@ bool tusb_hid_device_helper_ready(void)
 bool tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
 {
     if (!tud_mounted()) return false;
-    int timeout = 50;
+    int timeout = 5;
     while (!tud_hid_n_ready(0) && timeout-- > 0) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -239,7 +239,7 @@ bool tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
 bool tusb_hid_device_helper_mouse_report(uint8_t buttons, int8_t x, int8_t y, int8_t vertical)
 {
     if (!tud_mounted()) return false;
-    int timeout = 50;
+    int timeout = 5;
     while (!tud_hid_n_ready(0) && timeout-- > 0) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }

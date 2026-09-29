@@ -4,10 +4,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/evdev"
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/protocol"
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/transport"
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/ui"
@@ -17,6 +21,7 @@ func main() {
 	// Flags
 	serialPort := flag.String("serial", "", "Serial port for ESP32-S3 transmitter dongle (e.g. /dev/ttyUSB0, auto-detected if empty)")
 	baudRate := flag.Int("baud", 115200, "Serial baud rate")
+	startGrabbed := flag.Bool("grab", false, "Start immediately in hardware grab mode (locks physical input to target PC)")
 
 	injectText := flag.String("text", "", "CLI one-shot: inject text string to target PC without TUI")
 	injectMacro := flag.String("macro", "", "CLI one-shot: execute macro ('cad' for Ctrl+Alt+Del, 'lock' for Win+L, etc.)")
@@ -64,9 +69,52 @@ func main() {
 		return
 	}
 
-	// 3. Full Interactive Bubbletea TUI Mode
-	m := ui.NewModel(trans)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	// 3. Hardware KVM Grabber Mode
+	var (
+		p      *tea.Program
+		progMu sync.Mutex
+	)
+
+	grabber, err := evdev.NewGrabber(trans, func(evt evdev.GrabEvent) {
+		progMu.Lock()
+		defer progMu.Unlock()
+		if p != nil {
+			p.Send(ui.GrabMsg(evt))
+		}
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing physical input grabber: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Tip: Run with 'sudo ./cardputer-kvm' to grant access to /dev/input/event* devices.\n")
+		os.Exit(1)
+	}
+	defer grabber.Close()
+
+	// Start continuous background reader loops on physical devices
+	grabber.Start()
+
+	if *startGrabbed {
+		_ = grabber.SetGrab(true)
+	}
+
+	// Trap OS termination signals to ensure input is always ungrabbed on exit
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		_ = grabber.Close()
+		progMu.Lock()
+		if p != nil {
+			p.Quit()
+		}
+		progMu.Unlock()
+		os.Exit(0)
+	}()
+
+	// 4. Run Interactive Bubbletea Hardware KVM HUD
+	m := ui.NewModel(trans, grabber)
+	progMu.Lock()
+	p = tea.NewProgram(m, tea.WithAltScreen())
+	progMu.Unlock()
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)

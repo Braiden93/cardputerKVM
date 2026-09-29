@@ -107,6 +107,23 @@ const (
 	KeyLeftArrow   = byte(0x50)
 	KeyDownArrow   = byte(0x51)
 	KeyUpArrow     = byte(0x52)
+	KeyNumLock     = byte(0x53)
+	KeyKpSlash     = byte(0x54)
+	KeyKpAsterisk  = byte(0x55)
+	KeyKpMinus     = byte(0x56)
+	KeyKpPlus      = byte(0x57)
+	KeyKpEnter     = byte(0x58)
+	KeyKp1         = byte(0x59)
+	KeyKp2         = byte(0x5A)
+	KeyKp3         = byte(0x5B)
+	KeyKp4         = byte(0x5C)
+	KeyKp5         = byte(0x5D)
+	KeyKp6         = byte(0x5E)
+	KeyKp7         = byte(0x5F)
+	KeyKp8         = byte(0x60)
+	KeyKp9         = byte(0x61)
+	KeyKp0         = byte(0x62)
+	KeyKpDot       = byte(0x63)
 )
 
 // KeyPacket represents the 12-byte wire format matching kvm_key_packet_t
@@ -383,6 +400,40 @@ func KeyName(keycode byte) string {
 		return "Down"
 	case KeyUpArrow:
 		return "Up"
+	case KeyNumLock:
+		return "NumLock"
+	case KeyKpSlash:
+		return "Kp/"
+	case KeyKpAsterisk:
+		return "Kp*"
+	case KeyKpMinus:
+		return "Kp-"
+	case KeyKpPlus:
+		return "Kp+"
+	case KeyKpEnter:
+		return "KpEnter"
+	case KeyKp1:
+		return "Kp1"
+	case KeyKp2:
+		return "Kp2"
+	case KeyKp3:
+		return "Kp3"
+	case KeyKp4:
+		return "Kp4"
+	case KeyKp5:
+		return "Kp5"
+	case KeyKp6:
+		return "Kp6"
+	case KeyKp7:
+		return "Kp7"
+	case KeyKp8:
+		return "Kp8"
+	case KeyKp9:
+		return "Kp9"
+	case KeyKp0:
+		return "Kp0"
+	case KeyKpDot:
+		return "Kp."
 	default:
 		return "None"
 	}

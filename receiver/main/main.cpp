@@ -81,6 +81,60 @@ static void send_test_greeting()
 
 // Forward declarations
 static void process_kvm_packet(const uint8_t *data, int len, const char *source_tag);
+static void update_display(bool force = false);
+
+typedef struct {
+    uint8_t pkt_type;
+    uint8_t modifiers;
+    uint8_t keycodes[6];
+    uint8_t buttons;
+    int8_t  dx;
+    int8_t  dy;
+    int8_t  wheel;
+    char    source_tag[12];
+} kvm_event_t;
+
+static QueueHandle_t s_kvm_queue = NULL;
+
+static void kvm_dispatcher_task(void *pvParameters)
+{
+    kvm_event_t evt;
+    ESP_LOGI(TAG, "KVM USB Dispatcher Task started.");
+
+    while (1) {
+        if (xQueueReceive(s_kvm_queue, &evt, portMAX_DELAY)) {
+            if (!tusb_hid_device_helper_is_mounted()) continue;
+
+            if (evt.pkt_type == KVM_PKT_KEY_REPORT) {
+                bool has_key = false;
+                for (int i = 0; i < 6; i++) {
+                    if (evt.keycodes[i] != 0) {
+                        has_key = true;
+                        break;
+                    }
+                }
+                uint8_t *keys = has_key ? evt.keycodes : NULL;
+                tusb_hid_device_helper_report(evt.modifiers, keys);
+
+                last_key_code = evt.keycodes[0];
+                last_key_name = has_key ? "Remote Key" : "Released";
+                key_count++;
+                update_display();
+
+                ESP_LOGI(TAG, "[%s] Key: Mod=0x%02X Code=0x%02X (%s)",
+                         evt.source_tag, evt.modifiers, evt.keycodes[0], last_key_name.c_str());
+            } else if (evt.pkt_type == KVM_PKT_MOUSE_MOVE) {
+                tusb_hid_device_helper_mouse_report(evt.buttons, evt.dx, evt.dy, evt.wheel);
+                last_key_name = "Mouse";
+                key_count++;
+                update_display();
+
+                ESP_LOGD(TAG, "[%s] Mouse: Btn=0x%02X dX=%d dY=%d Wheel=%d",
+                         evt.source_tag, evt.buttons, evt.dx, evt.dy, evt.wheel);
+            }
+        }
+    }
+}
 
 static void process_kvm_packet(const uint8_t *data, int len, const char *source_tag)
 {
@@ -95,28 +149,27 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
 
     if (pkt_type == KVM_PKT_KEY_REPORT && len >= sizeof(kvm_key_packet_t)) {
         const kvm_key_packet_t *pkt = (const kvm_key_packet_t*)data;
-
-        // Forward keystroke directly to host PC via USB
-        if (tusb_hid_device_helper_is_mounted()) {
-            tusb_hid_device_helper_report(pkt->modifiers, (uint8_t*)pkt->keycodes);
+        kvm_event_t evt = {};
+        evt.pkt_type = pkt_type;
+        evt.modifiers = pkt->modifiers;
+        memcpy(evt.keycodes, pkt->keycodes, 6);
+        strncpy(evt.source_tag, source_tag, sizeof(evt.source_tag)-1);
+        if (s_kvm_queue) {
+            xQueueSend(s_kvm_queue, &evt, 0);
         }
-
-        last_key_code = pkt->keycodes[0];
-        last_key_name = (last_key_code != 0) ? "Remote Key" : "Released";
-        key_count++;
-
-        ESP_LOGI(TAG, "[%s] Key: Mod=0x%02X Key=0x%02X",
-                 source_tag, pkt->modifiers, pkt->keycodes[0]);
     }
     else if (pkt_type == KVM_PKT_MOUSE_MOVE && len >= sizeof(kvm_mouse_packet_t)) {
         const kvm_mouse_packet_t *pkt = (const kvm_mouse_packet_t*)data;
-        if (tusb_hid_device_helper_is_mounted()) {
-            tusb_hid_device_helper_mouse_report(pkt->buttons, pkt->dx, pkt->dy, pkt->wheel);
+        kvm_event_t evt = {};
+        evt.pkt_type = pkt_type;
+        evt.buttons = pkt->buttons;
+        evt.dx = pkt->dx;
+        evt.dy = pkt->dy;
+        evt.wheel = pkt->wheel;
+        strncpy(evt.source_tag, source_tag, sizeof(evt.source_tag)-1);
+        if (s_kvm_queue) {
+            xQueueSend(s_kvm_queue, &evt, 0);
         }
-        last_key_name = "Mouse";
-        key_count++;
-        ESP_LOGD(TAG, "[%s] Mouse: Btn=0x%02X dX=%d dY=%d Wheel=%d",
-                 source_tag, pkt->buttons, pkt->dx, pkt->dy, pkt->wheel);
     }
     else if (pkt_type == KVM_PKT_HEARTBEAT) {
         ESP_LOGD(TAG, "[%s] Heartbeat received", source_tag);
@@ -215,7 +268,7 @@ static void init_wireless_receiver()
     ESP_LOGI(TAG, "Wireless Receiver ready: ESP-NOW + UDP (SoftAP: %s, Ch: %d)", ssid, KVM_ESPNOW_CHANNEL);
 }
 
-static void update_display(bool force = false)
+static void update_display(bool force)
 {
     static bool prev_mounted = false;
     static bool prev_rf_linked = false;
@@ -320,10 +373,14 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Cardputer-ADV Keyboard initialized successfully.");
     }
 
-    // 4. Initialize Wireless Receiver (ESP-NOW + SoftAP + UDP Server)
+    // 4. Create KVM USB Event Queue and Dispatcher Task
+    s_kvm_queue = xQueueCreate(64, sizeof(kvm_event_t));
+    xTaskCreate(kvm_dispatcher_task, "kvm_disp", 4096, NULL, 10, NULL);
+
+    // 5. Initialize Wireless Receiver (ESP-NOW + SoftAP + UDP Server)
     init_wireless_receiver();
 
-    // 5. Hook Local Keyboard Event Callback
+    // 6. Hook Local Keyboard Event Callback
     keyboard.onKeyEvent.connect([](const Keyboard::KeyEvent_t& keyEvent) {
         if (!tusb_hid_device_helper_is_mounted()) {
             return;

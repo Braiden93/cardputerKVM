@@ -143,7 +143,7 @@ func (s *SerialTransport) SendKey(modifier byte, keycode byte) error {
 		return err
 	}
 
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
 	return s.SendRelease()
 }
 
@@ -297,7 +297,7 @@ func (t *UDPTransport) SendKey(modifier byte, keycode byte) error {
 		return err
 	}
 
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
 	return t.SendRelease()
 }
 

@@ -39,14 +39,18 @@ var (
 			Bold(true).
 			Foreground(ColorSlateBg).
 			Background(ColorSecondary).
-			Padding(0, 1).
-			MarginLeft(1)
+			Padding(0, 1)
+
+	HeaderRate = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorSlateBg).
+			Background(ColorGreen).
+			Padding(0, 1)
 
 	HeaderProfile = lipgloss.NewStyle().
 			Foreground(ColorYellow).
 			Background(ColorCardAlt).
-			Padding(0, 1).
-			MarginLeft(1)
+			Padding(0, 1)
 
 	// Status Badges
 	StatusConnected = lipgloss.NewStyle().
@@ -59,6 +63,19 @@ var (
 			Bold(true).
 			Foreground(ColorSlateBg).
 			Background(ColorRed).
+			Padding(0, 1)
+
+	// Status Pills
+	PillPassThrough = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorSlateBg).
+			Background(ColorYellow).
+			Padding(0, 1)
+
+	PillGrabbed = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorSlateBg).
+			Background(ColorGreen).
 			Padding(0, 1)
 
 	// Navigation Tabs
@@ -88,11 +105,35 @@ var (
 			Background(ColorCardBg).
 			Padding(1, 2)
 
+	CardBoxSlim = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColorBorder).
+			Background(ColorCardBg).
+			Padding(0, 1)
+
+	CardBoxSlimActive = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColorGreen).
+			Background(ColorCardBg).
+			Padding(0, 1)
+
 	CardBoxWarning = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(ColorSecondary).
 			Background(ColorCardBg).
 			Padding(1, 2)
+
+	// Mouse Button HUD Badges
+	BtnActive = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorSlateBg).
+			Background(ColorYellow).
+			Padding(0, 1)
+
+	BtnInactive = lipgloss.NewStyle().
+			Foreground(ColorTextDim).
+			Background(ColorCardAlt).
+			Padding(0, 1)
 
 	// Live Capture HUD
 	HudBox = lipgloss.NewStyle().
@@ -142,11 +183,14 @@ var (
 	// Telemetry Labels
 	StatLabel = lipgloss.NewStyle().
 			Foreground(ColorTextDim).
-			Width(16)
+			Width(15)
 
 	StatValue = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(ColorPrimary)
+
+	StatValueDim = lipgloss.NewStyle().
+			Foreground(ColorTextDim)
 
 	// Help / Footer Bar
 	FooterKey = lipgloss.NewStyle().

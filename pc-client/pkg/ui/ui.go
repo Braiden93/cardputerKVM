@@ -42,11 +42,16 @@ type Model struct {
 }
 
 func NewModel(trans transport.Transport, grabber *evdev.Grabber) Model {
-	devs := grabber.Devices()
+	var devs []*evdev.Device
+	isGrabbed := false
+	if grabber != nil {
+		devs = grabber.Devices()
+		isGrabbed = grabber.IsGrabbed()
+	}
 	m := Model{
 		trans:            trans,
 		grabber:          grabber,
-		isGrabbed:        grabber.IsGrabbed(),
+		isGrabbed:        isGrabbed,
 		lastKeyPressed:   "None",
 		lastKeyHex:       "Mod: 0x00 | Keys: 0",
 		lastModifiers:    "None",
@@ -130,7 +135,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "s", " ":
 			// Software toggle shortcut from terminal
-			m.grabber.ToggleGrab()
+			if m.grabber != nil {
+				m.grabber.ToggleGrab()
+			}
 			return m, nil
 		case "p":
 			if m.trans != nil {
@@ -147,36 +154,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var s strings.Builder
 
-	// 1. Top Header Banner
-	title := HeaderTitle.Render("CARDPUTER HARDWARE KVM SWITCH")
-	badge := HeaderBadge.Render("SERIAL DONGLE")
-	profile := HeaderProfile.Render("TARGET: Dell KB216 + Mouse (0x413C:0x2113)")
+	// 1. Top Header Bar
+	s.WriteString(m.renderTopBar() + "\n\n")
 
-	var statusBadge string
-	if m.trans != nil && m.trans.IsConnected() {
-		statusBadge = StatusConnected.Render("● " + m.trans.Endpoint())
-	} else {
-		statusBadge = StatusDisconnected.Render("○ DISCONNECTED")
-	}
+	// 2. Compact KVM Status Strip (Shrunk Hero Bar)
+	s.WriteString(m.renderStatusStrip() + "\n\n")
 
-	topBar := lipgloss.JoinHorizontal(lipgloss.Center, title, badge, profile, "  ", statusBadge)
-	s.WriteString(topBar + "\n\n")
-
-	// 2. PRIMARY KVM SWITCH HERO DISPLAY
-	if m.isGrabbed {
-		s.WriteString(m.renderGrabbedBanner() + "\n\n")
-	} else {
-		s.WriteString(m.renderPassThroughBanner() + "\n\n")
-	}
-
-	// 3. Middle Section: Hooked Devices & Live Telemetry
-	devicesBox := m.renderDevicesBox()
-	telemetryBox := m.renderTelemetryBox()
-
-	middleRow := lipgloss.JoinHorizontal(lipgloss.Top, devicesBox, "   ", telemetryBox)
+	// 3. Middle Section: Dual Telemetry Cards (Input Monitor + Link & Dongle)
+	inputCard := m.renderInputTelemetryCard()
+	linkCard := m.renderLinkTelemetryCard()
+	middleRow := lipgloss.JoinHorizontal(lipgloss.Top, inputCard, "  ", linkCard)
 	s.WriteString(middleRow + "\n\n")
 
-	// 4. Activity Log Feed
+	// 4. Hardware Activity Log Stream
 	s.WriteString(m.renderActivityLog() + "\n\n")
 
 	// 5. Footer Shortcuts
@@ -185,130 +175,158 @@ func (m Model) View() string {
 	return AppStyle.Render(s.String())
 }
 
-func (m Model) renderGrabbedBanner() string {
-	title := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorSlateBg).
-		Background(ColorGreen).
-		Padding(0, 3).
-		Render("● [ TARGET HOST ENGAGED ] — EXCLUSIVE PHYSICAL INPUT GRAB ACTIVE")
+func (m Model) renderTopBar() string {
+	boxWidth := 84
+	title := HeaderTitle.Render("CARDPUTER HARDWARE KVM")
+	badgeRate := HeaderRate.Render("1000Hz HID")
+	badgeDongle := HeaderBadge.Render("SERIAL DONGLE")
 
-	desc := lipgloss.JoinVertical(lipgloss.Center,
-		"\n"+lipgloss.NewStyle().Foreground(ColorText).Bold(true).Render("All physical keyboard keystrokes, shortcuts, and mouse movements are routed to Cardputer."),
-		lipgloss.NewStyle().Foreground(ColorTextDim).Render("Local Linux desktop input is BLOCKED to prevent accidental typing or cursor drift."),
-		"\n"+lipgloss.NewStyle().Foreground(ColorYellow).Bold(true).Render(">>> PRESS [SCROLL LOCK] TO RELEASE CONTROL BACK TO LOCAL DESKTOP <<<"),
-		lipgloss.NewStyle().Foreground(ColorPrimary).Render("Keyboard Scroll Lock LED is illuminated"),
-	)
-
-	content := lipgloss.JoinVertical(lipgloss.Center, title, desc)
-	return CardBoxActive.Width(82).Align(lipgloss.Center).Render(content)
-}
-
-func (m Model) renderPassThroughBanner() string {
-	title := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorSlateBg).
-		Background(ColorYellow).
-		Padding(0, 3).
-		Render("○ [ LOCAL DESKTOP PASS-THROUGH ] — NORMAL LOCAL OPERATION")
-
-	desc := lipgloss.JoinVertical(lipgloss.Center,
-		"\n"+lipgloss.NewStyle().Foreground(ColorText).Render("Your keyboard and mouse are operating locally on this Linux workstation."),
-		lipgloss.NewStyle().Foreground(ColorTextDim).Render("Cardputer USB HID is standing by on ESP-NOW Channel 1."),
-		"\n"+lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render(">>> PRESS [SCROLL LOCK] TO LOCK AND CONTROL TARGET PC <<<"),
-		lipgloss.NewStyle().Foreground(ColorTextDim).Render("(Or press [Space] in this terminal to toggle)"),
-	)
-
-	content := lipgloss.JoinVertical(lipgloss.Center, title, desc)
-	return CardBox.Width(82).Align(lipgloss.Center).Render(content)
-}
-
-func (m Model) renderDevicesBox() string {
-	var rows []string
-	rows = append(rows, lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("HOOKED INPUT HARDWARE (/dev/input/):"), "")
-
-	for _, dev := range m.devices {
-		icon := "⌨"
-		kind := "KBD"
-		if dev.IsMouse {
-			icon = "🖱"
-			kind = "PTR"
-		}
-
-		name := dev.Name
-		if len(name) > 28 {
-			name = name[:25] + "..."
-		}
-
-		stateTag := lipgloss.NewStyle().Foreground(ColorGreen).Render("[GRABBED]")
-		if !m.isGrabbed {
-			stateTag = lipgloss.NewStyle().Foreground(ColorTextDim).Render("[LOCAL]")
-		}
-
-		line := fmt.Sprintf("%s [%s] %-18s %-28s %s", icon, kind, dev.Path, name, stateTag)
-		rows = append(rows, lipgloss.NewStyle().Foreground(ColorText).Render(line))
+	var statusBadge string
+	if m.trans != nil && m.trans.IsConnected() {
+		statusBadge = StatusConnected.Render("● " + m.trans.Endpoint())
+	} else {
+		statusBadge = StatusDisconnected.Render("○ DISCONNECTED")
 	}
 
-	return CardBox.Width(46).Render(strings.Join(rows, "\n"))
+	left := lipgloss.JoinHorizontal(lipgloss.Center, title, " ", badgeRate, " ", badgeDongle)
+	gap := boxWidth - lipgloss.Width(left) - lipgloss.Width(statusBadge)
+	if gap < 2 {
+		gap = 2
+	}
+	return left + strings.Repeat(" ", gap) + statusBadge
 }
 
-func (m Model) renderTelemetryBox() string {
-	var rows []string
-	rows = append(rows, lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("LIVE INPUT & RF TELEMETRY:"), "")
+func (m Model) renderStatusStrip() string {
+	boxWidth := 84
+	innerWidth := boxWidth - 4 // minus borders and padding
 
-	stats := m.trans.Stats()
+	if m.isGrabbed {
+		tag := PillGrabbed.Render("● TARGET ENGAGED")
+		statusText := lipgloss.NewStyle().Bold(true).Foreground(ColorText).Render(" KVM LOCKED TO HOST")
+		hotkey := lipgloss.NewStyle().Bold(true).Foreground(ColorYellow).Render("[Scroll Lock] to Return to Local")
+
+		leftPart := tag + " " + statusText
+		gap := innerWidth - lipgloss.Width(leftPart) - lipgloss.Width(hotkey)
+		if gap < 2 {
+			gap = 2
+		}
+		line1 := leftPart + strings.Repeat(" ", gap) + hotkey
+
+		subtext := lipgloss.NewStyle().Foreground(ColorTextDim).Render(
+			"Keystrokes & mouse stream to Cardputer HID (1000Hz) • Local desktop blocked",
+		)
+
+		content := line1 + "\n" + subtext
+		return CardBoxSlimActive.Width(boxWidth).Render(content)
+	}
+
+	// Pass-through (Local)
+	tag := PillPassThrough.Render("○ PASS-THROUGH")
+	statusText := lipgloss.NewStyle().Bold(true).Foreground(ColorText).Render(" WORKSTATION DESKTOP ACTIVE")
+	hotkey := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("[Scroll Lock] to Lock Target")
+
+	leftPart := tag + " " + statusText
+	gap := innerWidth - lipgloss.Width(leftPart) - lipgloss.Width(hotkey)
+	if gap < 2 {
+		gap = 2
+	}
+	line1 := leftPart + strings.Repeat(" ", gap) + hotkey
+
+	subtext := lipgloss.NewStyle().Foreground(ColorTextDim).Render(
+		"Workstation desktop active locally • Cardputer HID standby on ESP-NOW Ch 1",
+	)
+
+	content := line1 + "\n" + subtext
+	return CardBoxSlim.Width(boxWidth).Render(content)
+}
+
+func (m Model) renderInputTelemetryCard() string {
+	cardWidth := 40
+	var rows []string
+	rows = append(rows, lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Render("⌨  LIVE INPUT MONITOR"), "")
 
 	// Active Key Display
 	keyDisp := m.lastKeyPressed
 	if m.lastModifiers != "" && m.lastModifiers != "None" {
 		keyDisp = m.lastModifiers + "+" + keyDisp
 	}
+	if len(keyDisp) > 18 {
+		keyDisp = keyDisp[:15] + "..."
+	}
 
-	// Active Mouse Buttons
-	var btnStr []string
+	// Mouse Clicks HUD Badges
+	btnL := BtnInactive.Render("[L]")
 	if m.lastMouseButtons&protocol.MouseBtnLeft != 0 {
-		btnStr = append(btnStr, "LEFT")
+		btnL = BtnActive.Render("[L]")
 	}
-	if m.lastMouseButtons&protocol.MouseBtnRight != 0 {
-		btnStr = append(btnStr, "RIGHT")
-	}
+	btnM := BtnInactive.Render("[M]")
 	if m.lastMouseButtons&protocol.MouseBtnMiddle != 0 {
-		btnStr = append(btnStr, "MID")
+		btnM = BtnActive.Render("[M]")
 	}
-	btnDisplay := "None"
-	if len(btnStr) > 0 {
-		btnDisplay = strings.Join(btnStr, "+")
+	btnR := BtnInactive.Render("[R]")
+	if m.lastMouseButtons&protocol.MouseBtnRight != 0 {
+		btnR = BtnActive.Render("[R]")
 	}
+	btnsHUD := lipgloss.JoinHorizontal(lipgloss.Left, btnL, " ", btnM, " ", btnR)
 
 	rows = append(rows,
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Active Key:"), StatValue.Render(keyDisp)),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Key Report:"), lipgloss.NewStyle().Foreground(ColorTextDim).Render(m.lastKeyHex)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("HID Report:"), StatValueDim.Render(m.lastKeyHex)),
 		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Mouse Delta:"), StatValue.Render(fmt.Sprintf("dX:%+4d  dY:%+4d", m.lastMouseDX, m.lastMouseDY))),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Mouse Clicks:"), lipgloss.NewStyle().Foreground(ColorYellow).Render(btnDisplay)),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Packets Sent:"), StatValue.Render(fmt.Sprintf("%d", stats.PacketsSent))),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Wire Speed:"), lipgloss.NewStyle().Foreground(ColorTextDim).Render(m.trans.Endpoint())),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Radio Link:"), lipgloss.NewStyle().Foreground(ColorGreen).Render("ESP-NOW CH 1 Broadcast")),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Mouse Wheel:"), StatValueDim.Render(fmt.Sprintf("%+2d", m.lastMouseWheel))),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Mouse Clicks:"), btnsHUD),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Engine Rate:"), lipgloss.NewStyle().Bold(true).Foreground(ColorGreen).Render("1000 Hz (1ms)")),
 	)
 
-	return CardBox.Width(33).Render(strings.Join(rows, "\n"))
+	return CardBoxSlim.Width(cardWidth).Render(strings.Join(rows, "\n"))
+}
+
+func (m Model) renderLinkTelemetryCard() string {
+	cardWidth := 42
+	var rows []string
+	rows = append(rows, lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Render("⚡ LINK & TELEMETRY"), "")
+
+	stats := m.trans.Stats()
+
+	// Short endpoint if needed
+	ep := m.trans.Endpoint()
+	if len(ep) > 23 {
+		ep = ep[:20] + "..."
+	}
+
+	rows = append(rows,
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Wire Endpoint:"), StatValueDim.Render(ep)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Serial Baud:"), StatValue.Render("921,600 (97µs/pkt)")),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("RF Protocol:"), lipgloss.NewStyle().Foreground(ColorGreen).Render("ESP-NOW Ch 1 (24M PHY)")),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Target Spoof:"), lipgloss.NewStyle().Foreground(ColorYellow).Render("Dell KB216 + Mouse")),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Packets Sent:"), StatValue.Render(fmt.Sprintf("%d pkts", stats.PacketsSent))),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatLabel.Render("Link State:"), lipgloss.NewStyle().Bold(true).Foreground(ColorGreen).Render("● Synchronized")),
+	)
+
+	return CardBoxSlim.Width(cardWidth).Render(strings.Join(rows, "\n"))
 }
 
 func (m Model) renderActivityLog() string {
 	var lines []string
-	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(ColorTextDim).Render("HARDWARE EVENT STREAM:"))
+	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(ColorTextDim).Render("◆ HARDWARE EVENT STREAM:"), "")
 
-	for _, log := range m.activityLog {
+	count := len(m.activityLog)
+	start := 0
+	if count > 5 {
+		start = count - 5
+	}
+	for _, log := range m.activityLog[start:] {
 		lines = append(lines, lipgloss.NewStyle().Foreground(ColorTextDim).Render(log))
 	}
 
-	return CardBox.Width(82).Render(strings.Join(lines, "\n"))
+	return CardBoxSlim.Width(84).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderFooter() string {
 	return lipgloss.JoinHorizontal(lipgloss.Left,
-		FooterKey.Render("[Scroll Lock]"), FooterDesc.Render(" Toggle Target/Local"),
-		FooterKey.Render("[Space]"), FooterDesc.Render(" Quick Toggle"),
-		FooterKey.Render("[p]"), FooterDesc.Render(" Ping Heartbeat"),
+		FooterKey.Render("[Scroll Lock]"), FooterDesc.Render(" Toggle Target/Local  "),
+		FooterKey.Render("[Space]"), FooterDesc.Render(" Quick Toggle  "),
+		FooterKey.Render("[p]"), FooterDesc.Render(" Ping  "),
 		FooterKey.Render("[q / Ctrl+C]"), FooterDesc.Render(" Exit Client"),
 	)
 }

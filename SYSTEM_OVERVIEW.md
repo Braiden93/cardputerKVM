@@ -58,10 +58,12 @@ graph TD
 * **Keyboard:** 56-key matrix scanned by an onboard **TCA8418 I²C controller** (`0x34`, INT on GPIO 11), providing a local physical keyboard override at the host machine.
 * **Framework:** M5Stack official HAL (`M5Unified`, `M5GFX`, `Adafruit_TCA8418`, `tusb_hid_device_helper`).
 
-### Transmitter: `ESP32-S3 Remote`
-* **Role:** Remote handheld input device.
-* **Core:** ESP32-S3 (Uno board, custom keypad, or handheld controller).
-* **Wireless:** ESP-NOW transmitter emitting keycode events to the Cardputer-ADV MAC address.
+### Transmitter: `ESP32-S3 N16R8`
+* **Role:** Remote wireless input transmitter.
+* **Core:** ESP32-S3 (dual-core 240MHz).
+* **Memory:** 16MB Flash (`DIO 80MHz`) + 8MB Octal PSRAM (`OPI 80MHz`).
+* **Input Interfaces:** Onboard BOOT button (GPIO 0), interactive UART0 terminal console bridge, expandable GPIO/ADC headers.
+* **Wireless:** ESP-NOW 2.4 GHz RF transmitter (Channel 1, broadcast pairing).
 
 ---
 
@@ -80,15 +82,18 @@ idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-### Build Transmitter
+### Build Transmitter (ESP32-S3 N16R8)
 ```bash
 cd transmitter
 idf.py set-target esp32s3
 idf.py build
+idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
 ---
 
 ## 6. Reference Documentation
+* **[`README.md`](file:///media/thunder/LinWin/Projectos/Cardputer-KVM/README.md):** Main project landing page, architecture overview, and quick start guide.
 * **[CARDPUTER_ADV_RECEIVER_VERIFICATION.md](file:///media/thunder/LinWin/Projectos/Cardputer-KVM/CARDPUTER_ADV_RECEIVER_VERIFICATION.md):** Verification log, kernel `dmesg` outputs, and HAL integration details.
-* **[`receiver/README.md`](file:///media/thunder/LinWin/Projectos/Cardputer-KVM/receiver/README.md):** Build, flash, and test instructions for the Cardputer-ADV receiver firmware.
+* **[`receiver/README.md`](file:///media/thunder/LinWin/Projectos/Cardputer-KVM/receiver/README.md):** Receiver firmware details, partition table, and build steps.
+* **[`transmitter/README.md`](file:///media/thunder/LinWin/Projectos/Cardputer-KVM/transmitter/README.md):** Transmitter firmware and N16R8 PSRAM configuration.

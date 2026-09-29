@@ -1,18 +1,24 @@
 /*
- * Cardputer-ADV KVM Receiver Test — Official M5Stack HAL + Dell Keyboard Spoofing
+ * Cardputer-ADV KVM Receiver — Official M5Stack HAL + Dell Keyboard Spoofing + ESP-NOW
  *
  * Hardware: M5Stack Cardputer-ADV (ESP32-S3 + TCA8418 Keypad + ST7789 Display)
  * Features:
  *   - Native USB OTG emulating Dell KB216 Wired Keyboard (VID: 0x413C, PID: 0x2113)
- *   - Official M5Stack TCA8418 Keyboard Driver (reads all physical keys & modifiers)
- *   - Physical keystrokes injected directly into target PC over USB-C
- *   - Visual status & live keypress log on 1.14" ST7789 LCD
- *   - G0 (BtnA) button press sends test string to PC
+ *   - ESP-NOW 2.4 GHz wireless receiver (Channel 1, ultra-low latency)
+ *   - Injects incoming wireless keystrokes directly into Host PC
+ *   - Local Cardputer-ADV keyboard override (TCA8418 I2C driver)
+ *   - Visual on-screen dashboard displaying USB status, RF link, battery, and live key log
  */
 
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -21,6 +27,7 @@
 
 #include "keyboard/keyboard.h"
 #include "utils/tusb_hid_device/tusb_hid_device_helper.h"
+#include "kvm_protocol.h"
 
 static const char* TAG = "CARDPUTER_KVM";
 
@@ -29,6 +36,11 @@ static bool was_usb_mounted = false;
 static std::string last_key_name = "None";
 static uint8_t last_key_code = 0;
 static uint32_t key_count = 0;
+
+// ESP-NOW Remote Link State
+static char remote_mac_str[18] = "None";
+static uint32_t last_remote_packet_time = 0;
+static bool remote_linked = false;
 
 static void send_hid_key(uint8_t modifier, uint8_t keycode)
 {
@@ -62,72 +74,152 @@ static void send_test_greeting()
     }
 }
 
+// ESP-NOW Receive Callback
+static void on_espnow_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (len < sizeof(uint16_t)) return;
+    uint16_t magic = *(uint16_t*)data;
+    if (magic != KVM_ESPNOW_MAGIC) return;
+
+    // Record remote transmitter MAC
+    snprintf(remote_mac_str, sizeof(remote_mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+    last_remote_packet_time = esp_log_timestamp();
+    remote_linked = true;
+
+    uint8_t pkt_type = data[2];
+
+    if (pkt_type == KVM_PKT_KEY_REPORT && len >= sizeof(kvm_key_packet_t)) {
+        const kvm_key_packet_t *pkt = (const kvm_key_packet_t*)data;
+
+        // Forward keystroke directly to host PC via USB
+        if (tusb_hid_device_helper_is_mounted()) {
+            tusb_hid_device_helper_report(pkt->modifiers, (uint8_t*)pkt->keycodes);
+        }
+
+        last_key_code = pkt->keycodes[0];
+        last_key_name = (last_key_code != 0) ? "Remote Key" : "Released";
+        key_count++;
+
+        ESP_LOGI(TAG, "RF Key Report from %s: Mod=0x%02X Key=0x%02X",
+                 remote_mac_str, pkt->modifiers, pkt->keycodes[0]);
+    }
+    else if (pkt_type == KVM_PKT_HEARTBEAT) {
+        ESP_LOGD(TAG, "RF Heartbeat from %s", remote_mac_str);
+    }
+}
+
+static void init_espnow_receiver()
+{
+    ESP_LOGI(TAG, "Initializing Wi-Fi and ESP-NOW on Channel %d...", KVM_ESPNOW_CHANNEL);
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(KVM_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
+
+    ESP_LOGI(TAG, "ESP-NOW Receiver ready on Channel %d", KVM_ESPNOW_CHANNEL);
+}
+
 static void update_display(bool force = false)
 {
     static bool prev_mounted = false;
+    static bool prev_rf_linked = false;
     static std::string prev_key = "";
     static int prev_batt = -1;
 
     bool current_mounted = tusb_hid_device_helper_is_mounted();
     int current_batt = M5.Power.getBatteryLevel();
 
-    if (!force && prev_mounted == current_mounted && prev_key == last_key_name && prev_batt == current_batt) {
+    // Check remote link timeout (5 seconds)
+    bool is_rf_alive = (esp_log_timestamp() - last_remote_packet_time < 5000) && remote_linked;
+
+    if (!force && prev_mounted == current_mounted && prev_rf_linked == is_rf_alive &&
+        prev_key == last_key_name && prev_batt == current_batt) {
         return;
     }
 
     prev_mounted = current_mounted;
+    prev_rf_linked = is_rf_alive;
     prev_key = last_key_name;
     prev_batt = current_batt;
 
     M5.Display.startWrite();
 
     // Top Header Bar
-    M5.Display.fillRect(0, 0, 240, 22, 0x10A2); // Dark blue header
+    M5.Display.fillRect(0, 0, 240, 20, 0x10A2); // Dark blue header
     M5.Display.setTextColor(TFT_WHITE, 0x10A2);
     M5.Display.setTextSize(1);
-    M5.Display.drawString("Cardputer-ADV  |  Dell Spoof", 6, 6);
+    M5.Display.drawString("Cardputer-ADV KVM", 6, 5);
 
     char batt_str[16];
     snprintf(batt_str, sizeof(batt_str), "%d%%", current_batt);
-    M5.Display.drawRightString(batt_str, 234, 6);
+    M5.Display.drawRightString(batt_str, 234, 5);
 
     // USB Connection Status Banner
     if (current_mounted) {
-        M5.Display.fillRect(6, 28, 228, 28, 0x03E0); // Green
+        M5.Display.fillRect(6, 24, 228, 22, 0x03E0); // Green
         M5.Display.setTextColor(TFT_WHITE, 0x03E0);
-        M5.Display.drawCenterString("USB: CONNECTED (Dell KB216)", 120, 36);
+        M5.Display.drawCenterString("USB: CONNECTED (Dell KB216)", 120, 30);
     } else {
-        M5.Display.fillRect(6, 28, 228, 28, 0x7800); // Dark red / orange
+        M5.Display.fillRect(6, 24, 228, 22, 0x7800); // Dark red / orange
         M5.Display.setTextColor(TFT_WHITE, 0x7800);
-        M5.Display.drawCenterString("USB: WAITING FOR PC (Plug USB-C)", 120, 36);
+        M5.Display.drawCenterString("USB: WAITING FOR HOST PC", 120, 30);
+    }
+
+    // Wireless RF Link Banner
+    if (is_rf_alive) {
+        M5.Display.fillRect(6, 50, 228, 22, 0x0013); // Dark teal
+        M5.Display.setTextColor(0x07FF, 0x0013); // Cyan
+        char rf_str[48];
+        snprintf(rf_str, sizeof(rf_str), "RF: LINKED [%.8s...]", remote_mac_str);
+        M5.Display.drawCenterString(rf_str, 120, 56);
+    } else {
+        M5.Display.fillRect(6, 50, 228, 22, 0x2124); // Dark gray
+        M5.Display.setTextColor(TFT_YELLOW, 0x2124);
+        M5.Display.drawCenterString("RF: ESP-NOW CH 1 (LISTENING)", 120, 56);
     }
 
     // Keypress Display Box
-    M5.Display.fillRect(6, 62, 228, 48, 0x18E3); // Dark slate panel
-    M5.Display.drawRect(6, 62, 228, 48, 0x4A69);
-    M5.Display.setTextColor(0x07FF, 0x18E3); // Cyan
-    M5.Display.drawString("Last Input:", 14, 68);
+    M5.Display.fillRect(6, 76, 228, 38, 0x18E3); // Dark slate panel
+    M5.Display.drawRect(6, 76, 228, 38, 0x4A69);
 
     M5.Display.setTextColor(TFT_WHITE, 0x18E3);
     char key_info[64];
-    snprintf(key_info, sizeof(key_info), "Key: %-8s  Code: 0x%02X", last_key_name.c_str(), last_key_code);
-    M5.Display.drawString(key_info, 14, 84);
+    snprintf(key_info, sizeof(key_info), "Input: %-10s (0x%02X)", last_key_name.c_str(), last_key_code);
+    M5.Display.drawString(key_info, 12, 88);
 
     char count_info[32];
     snprintf(count_info, sizeof(count_info), "Sent: %lu", (unsigned long)key_count);
-    M5.Display.drawRightString(count_info, 226, 84);
+    M5.Display.drawRightString(count_info, 226, 88);
 
     // Bottom Help Line
-    M5.Display.fillRect(0, 116, 240, 19, TFT_BLACK);
+    M5.Display.fillRect(0, 118, 240, 17, TFT_BLACK);
     M5.Display.setTextColor(TFT_DARKGRAY, TFT_BLACK);
-    M5.Display.drawCenterString("Type keys or press G0 to test injection", 120, 120);
+    M5.Display.drawCenterString("Local & Wireless KVM Active", 120, 121);
 
     M5.Display.endWrite();
 }
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Cardputer-ADV KVM Dell Keyboard Test ===");
+    ESP_LOGI(TAG, "=== Cardputer-ADV KVM Receiver + ESP-NOW ===");
 
     // 1. Initialize M5Unified (Display, Power Management, Battery, I2C)
     auto cfg = M5.config();
@@ -150,7 +242,10 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Cardputer-ADV Keyboard initialized successfully.");
     }
 
-    // 4. Hook Keyboard Event Callback
+    // 4. Initialize ESP-NOW Receiver
+    init_espnow_receiver();
+
+    // 5. Hook Local Keyboard Event Callback
     keyboard.onKeyEvent.connect([](const Keyboard::KeyEvent_t& keyEvent) {
         if (!tusb_hid_device_helper_is_mounted()) {
             return;
@@ -169,11 +264,10 @@ extern "C" void app_main(void)
             last_key_code = keyEvent.keyCode;
             key_count++;
 
-            ESP_LOGI(TAG, "Key Pressed: %s (0x%02X) Mod: 0x%02X",
+            ESP_LOGI(TAG, "Local Key: %s (0x%02X) Mod: 0x%02X",
                      last_key_name.c_str(), keyEvent.keyCode, mod);
         } else { // Key Released
             tusb_hid_device_helper_report(keyboard.getModifierMask(), NULL);
-            ESP_LOGD(TAG, "Key Released");
         }
 
         update_display();
@@ -183,7 +277,7 @@ extern "C" void app_main(void)
 
     bool greeting_sent = false;
 
-    // 5. Main Event Loop
+    // 6. Main Event Loop
     while (1) {
         M5.update();
         keyboard.update();
@@ -191,7 +285,7 @@ extern "C" void app_main(void)
         bool is_mounted = tusb_hid_device_helper_is_mounted();
         if (is_mounted != was_usb_mounted) {
             was_usb_mounted = is_mounted;
-            ESP_LOGI(TAG, "USB Mounted Status Changed: %s", is_mounted ? "CONNECTED" : "DISCONNECTED");
+            ESP_LOGI(TAG, "USB Status: %s", is_mounted ? "CONNECTED" : "DISCONNECTED");
             update_display(true);
 
             // Auto-type greeting once after host enumeration
@@ -213,7 +307,7 @@ extern "C" void app_main(void)
             update_display(true);
         }
 
-        // Periodic UI refresh for battery / state
+        // Periodic UI refresh
         static uint32_t last_ui_tick = 0;
         uint32_t now = esp_log_timestamp();
         if (now - last_ui_tick > 1000) {

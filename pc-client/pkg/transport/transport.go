@@ -213,6 +213,10 @@ func (s *SerialTransport) SendString(text string, charDelay time.Duration) error
 
 // SendStringFast injects text at maximum safe speed (~125 chars/sec, 1,500 WPM) without dropping keystrokes.
 func (s *SerialTransport) SendStringFast(text string, cancel <-chan struct{}, onProgress func(done, total int)) error {
+	// Normalize line endings to avoid double-Enter on Windows CRLF text
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
 	runes := []rune(text)
 	total := len(runes)
 	done := 0

@@ -47,7 +47,47 @@ func ReadHostClipboard() (string, error) {
 		return wlOut.String(), nil
 	}
 
-	// 2. X11 Desktop (xclip / xsel)
+	// 2. Python GTK4 / GDK Wayland fallback (pre-installed on GNOME & CachyOS)
+	pyScript := `
+import gi
+try:
+    gi.require_version('Gtk', '4.0')
+    from gi.repository import Gtk, Gdk, GLib
+    import sys
+    Gtk.init()
+    disp = Gdk.Display.get_default()
+    if disp:
+        cb = disp.get_clipboard()
+        loop = GLib.MainLoop()
+        def on_done(cb, res):
+            try:
+                t = cb.read_text_finish(res)
+                if t: sys.stdout.write(t)
+            except Exception: pass
+            loop.quit()
+        cb.read_text_async(None, on_done)
+        GLib.timeout_add(1000, loop.quit)
+        loop.run()
+except Exception:
+    pass
+`
+	var pyCmd *exec.Cmd
+	if sudoUser != "" && os.Geteuid() == 0 {
+		pyCmd = exec.Command("sudo", "-u", sudoUser, "env",
+			fmt.Sprintf("XDG_RUNTIME_DIR=%s", runtimeDir),
+			fmt.Sprintf("WAYLAND_DISPLAY=%s", waylandDisplay),
+			"python3", "-c", pyScript)
+	} else {
+		pyCmd = exec.Command("python3", "-c", pyScript)
+	}
+
+	var pyOut bytes.Buffer
+	pyCmd.Stdout = &pyOut
+	if err := pyCmd.Run(); err == nil && pyOut.Len() > 0 {
+		return pyOut.String(), nil
+	}
+
+	// 3. X11 Desktop (xclip / xsel)
 	display := os.Getenv("DISPLAY")
 	if display == "" {
 		display = ":0"

@@ -57,6 +57,7 @@ static int32_t  live_display_mouse_wheel = 0;
 static uint8_t  live_display_mouse_buttons = 0;
 static uint8_t  last_clicked_buttons = 0;
 static uint32_t total_mouse_packets = 0;
+static uint32_t total_rx_packets = 0;
 
 // Offscreen Canvas for Tear-Free 25FPS Rendering
 static M5Canvas s_canvas(&M5.Display);
@@ -270,6 +271,7 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
     uint32_t now = esp_log_timestamp();
     last_remote_packet_time = now;
     remote_linked = true;
+    total_rx_packets++;
 
     uint8_t pkt_type = data[2];
 
@@ -405,7 +407,92 @@ static void draw_usb_icon(LovyanGFX &gfx, int x, int y, bool connected)
     gfx.drawString(connected ? "USB" : "NO USB", x + 14, y + 3);
 }
 
-static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked)
+static void draw_heart_icon(LovyanGFX &gfx, int hx, int hy, bool linked, bool is_beat)
+{
+    if (!linked) {
+        // Dormant / Disconnected Heart (Gray outline)
+        uint16_t col = 0x4A69; // Dim slate gray
+        gfx.drawPixel(hx + 2, hy + 0, col);
+        gfx.drawPixel(hx + 3, hy + 0, col);
+        gfx.drawPixel(hx + 6, hy + 0, col);
+        gfx.drawPixel(hx + 7, hy + 0, col);
+
+        gfx.drawPixel(hx + 1, hy + 1, col);
+        gfx.drawPixel(hx + 4, hy + 1, col);
+        gfx.drawPixel(hx + 5, hy + 1, col);
+        gfx.drawPixel(hx + 8, hy + 1, col);
+
+        gfx.drawPixel(hx + 0, hy + 2, col);
+        gfx.drawPixel(hx + 9, hy + 2, col);
+
+        gfx.drawPixel(hx + 0, hy + 3, col);
+        gfx.drawPixel(hx + 9, hy + 3, col);
+
+        gfx.drawPixel(hx + 1, hy + 4, col);
+        gfx.drawPixel(hx + 8, hy + 4, col);
+
+        gfx.drawPixel(hx + 2, hy + 5, col);
+        gfx.drawPixel(hx + 7, hy + 5, col);
+
+        gfx.drawPixel(hx + 3, hy + 6, col);
+        gfx.drawPixel(hx + 6, hy + 6, col);
+
+        gfx.drawPixel(hx + 4, hy + 7, col);
+        gfx.drawPixel(hx + 5, hy + 7, col);
+        return;
+    }
+
+    if (is_beat) {
+        // --- Big Beating Heart (Expanded 10x8, vibrant glowing red) ---
+        uint16_t red = 0xF800;       // Bright Red
+        uint16_t highlight = 0xFF9F; // Glossy Pink/White shine
+
+        // Top lobes
+        gfx.drawFastHLine(hx + 1, hy + 0, 3, red);
+        gfx.drawFastHLine(hx + 6, hy + 0, 3, red);
+
+        gfx.drawFastHLine(hx + 0, hy + 1, 5, red);
+        gfx.drawFastHLine(hx + 5, hy + 1, 5, red);
+
+        // Body
+        gfx.drawFastHLine(hx + 0, hy + 2, 10, red);
+        gfx.drawFastHLine(hx + 0, hy + 3, 10, red);
+        gfx.drawFastHLine(hx + 1, hy + 4, 8, red);
+        gfx.drawFastHLine(hx + 2, hy + 5, 6, red);
+        gfx.drawFastHLine(hx + 3, hy + 6, 4, red);
+        gfx.drawFastHLine(hx + 4, hy + 7, 2, red);
+
+        // Glossy highlight pixel on top-left lobe for 3D shine
+        gfx.drawPixel(hx + 2, hy + 1, highlight);
+        gfx.drawPixel(hx + 3, hy + 1, highlight);
+    } else {
+        // --- Small Resting Heart (Centered 8x6, deep crimson) ---
+        uint16_t crimson = 0xC800; // Deep Crimson Red
+
+        // Clear margin pixels so beat->rest shrink is sharp
+        gfx.drawFastHLine(hx + 0, hy + 0, 10, 0x10A2);
+        gfx.drawPixel(hx + 0, hy + 1, 0x10A2);
+        gfx.drawPixel(hx + 9, hy + 1, 0x10A2);
+        gfx.drawPixel(hx + 0, hy + 2, 0x10A2);
+        gfx.drawPixel(hx + 9, hy + 2, 0x10A2);
+        gfx.drawPixel(hx + 0, hy + 3, 0x10A2);
+        gfx.drawPixel(hx + 9, hy + 3, 0x10A2);
+        gfx.drawFastHLine(hx + 0, hy + 7, 10, 0x10A2);
+
+        // Top lobes
+        gfx.drawFastHLine(hx + 2, hy + 1, 2, crimson);
+        gfx.drawFastHLine(hx + 6, hy + 1, 2, crimson);
+
+        // Body
+        gfx.drawFastHLine(hx + 1, hy + 2, 8, crimson);
+        gfx.drawFastHLine(hx + 1, hy + 3, 8, crimson);
+        gfx.drawFastHLine(hx + 2, hy + 4, 6, crimson);
+        gfx.drawFastHLine(hx + 3, hy + 5, 4, crimson);
+        gfx.drawFastHLine(hx + 4, hy + 6, 2, crimson);
+    }
+}
+
+static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked, bool is_beat)
 {
     uint16_t col = linked ? 0x07FF : 0x7BEF; // Neon Cyan : Slate Gray
 
@@ -420,16 +507,20 @@ static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked)
     gfx.drawPixel(x + 8, y + 2, col);
     gfx.drawPixel(x + 9, y + 3, col);
 
-    // Outer radiating waves
-    gfx.drawPixel(x + 0, y + 3, col);
-    gfx.drawPixel(x + 1, y + 1, col);
-    gfx.drawFastHLine(x + 3, y - 1, 7, col);
-    gfx.drawPixel(x + 11, y + 1, col);
-    gfx.drawPixel(x + 12, y + 3, col);
+    // Outer radiating waves (glows bright when pulsing)
+    uint16_t outer_col = (linked && is_beat) ? 0xFFFF : col;
+    gfx.drawPixel(x + 0, y + 3, outer_col);
+    gfx.drawPixel(x + 1, y + 1, outer_col);
+    gfx.drawFastHLine(x + 3, y - 1, 7, outer_col);
+    gfx.drawPixel(x + 11, y + 1, outer_col);
+    gfx.drawPixel(x + 12, y + 3, outer_col);
 
     // Text label
     gfx.setTextColor(col, 0x10A2);
     gfx.drawString(linked ? "RF LINK" : "RF SCAN", x + 16, y + 3);
+
+    // Beating Heart (placed right next to RF LINK text at x + 63, y + 2)
+    draw_heart_icon(gfx, x + 63, y + 2, linked, is_beat);
 }
 
 static void draw_battery_icon(LovyanGFX &gfx, int x, int y, int batt_level)
@@ -607,6 +698,23 @@ static void update_display(bool force)
     int current_batt = M5.Power.getBatteryLevel();
     bool is_rf_alive = (now - last_remote_packet_time < 5000) && remote_linked;
 
+    // Beating Heart state:
+    // 1. Direct packet pulse: If any packet arrived in the last 150ms, heart actively pumps
+    // 2. Periodic rhythm: While RF is alive, beat in a rhythmic "lub-dub" cycle (1000ms period)
+    bool is_heart_beating = false;
+    if (is_rf_alive) {
+        uint32_t since_pkt = now - last_remote_packet_time;
+        if (since_pkt < 150) {
+            is_heart_beating = true;
+        } else {
+            uint32_t cycle = now % 1000;
+            // Lub-dub rhythm: pulse 1 (0..120ms), pulse 2 (200..320ms)
+            if (cycle < 120 || (cycle >= 200 && cycle < 320)) {
+                is_heart_beating = true;
+            }
+        }
+    }
+
     bool kbd_active = (now - last_kbd_event_time < 220);
     bool mouse_moving = (now - last_mouse_move_time < 220);
     bool left_clicked = (live_display_mouse_buttons & 0x01) ||
@@ -634,8 +742,8 @@ static void update_display(bool force)
     // USB Icon (x: 6, y: 4)
     draw_usb_icon(gfx, 6, 4, current_mounted);
 
-    // RF Icon (x: 76, y: 4)
-    draw_rf_icon(gfx, 76, 4, is_rf_alive);
+    // RF Icon with Beating Heart (x: 76, y: 4)
+    draw_rf_icon(gfx, 76, 4, is_rf_alive, is_heart_beating);
 
     // Battery Icon (x: 204, y: 5)
     draw_battery_icon(gfx, 204, 5, current_batt);
@@ -655,7 +763,7 @@ static void update_display(bool force)
     gfx.drawFastHLine(0, 117, 240, 0x2125);
 
     char pkt_str[32];
-    snprintf(pkt_str, sizeof(pkt_str), "PKTS: %lu", (unsigned long)(key_count + total_mouse_packets));
+    snprintf(pkt_str, sizeof(pkt_str), "PKTS: %lu", (unsigned long)(total_rx_packets + key_count));
     gfx.setTextColor(0x07FF, TFT_BLACK);
     gfx.drawString(pkt_str, 6, 122);
 
@@ -759,14 +867,16 @@ extern "C" void app_main(void)
             update_display(true);
         }
 
-        // Dynamic adaptive UI refresh (25Hz during motion/input, 5Hz when idle)
+        // Dynamic adaptive UI refresh (20-25Hz during motion/input/RF sync, 5Hz when idle)
         static uint32_t last_ui_tick = 0;
         uint32_t now = esp_log_timestamp();
+        bool is_rf_active = (now - last_remote_packet_time < 5000) && remote_linked;
         bool is_animating = (now - last_kbd_event_time < 250) ||
                             (now - last_mouse_move_time < 250) ||
                             (now - last_mouse_click_time < 250) ||
-                            (now - last_mouse_wheel_time < 250);
-        uint32_t interval = is_animating ? 40 : 200;
+                            (now - last_mouse_wheel_time < 250) ||
+                            is_rf_active;
+        uint32_t interval = is_animating ? 50 : 200;
 
         if (now - last_ui_tick >= interval) {
             last_ui_tick = now;

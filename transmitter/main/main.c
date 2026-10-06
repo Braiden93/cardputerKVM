@@ -183,27 +183,45 @@ static void send_string(const char *str)
 }
 
 /***********************************************************************
- * 2. Background Tasks
+ * 2. Background Tasks & Callbacks
  ***********************************************************************/
-
-// Heartbeat task: keeps link active on Cardputer display
-static void heartbeat_task(void *pvParameters)
-{
-    while (1) {
-        kvm_heartbeat_packet_t hb;
-        hb.magic = KVM_ESPNOW_MAGIC;
-        hb.pkt_type = KVM_PKT_HEARTBEAT;
-        hb.uptime_ms = esp_log_timestamp();
-        hb.seq_num = packet_seq++;
-
-        send_raw_packet(&hb, sizeof(hb));
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 2048
 #define UART_BAUD_RATE 921600
+
+static uint32_t last_uart_rx_time = 0;
+
+// ESP-NOW Receive Callback: Forward Cardputer Telemetry directly to PC Client via UART0
+static void on_espnow_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (len >= sizeof(kvm_telemetry_packet_t)) {
+        const kvm_telemetry_packet_t *pkt = (const kvm_telemetry_packet_t*)data;
+        if (pkt->magic == KVM_ESPNOW_MAGIC && pkt->pkt_type == KVM_PKT_TELEMETRY) {
+            uart_write_bytes(UART_PORT, data, sizeof(kvm_telemetry_packet_t));
+        }
+    }
+}
+
+// Arbitrated Heartbeat task: broadcasts idle standby beacon only when PC Client app is NOT running
+static void heartbeat_task(void *pvParameters)
+{
+    while (1) {
+        uint32_t now = esp_log_timestamp();
+        // If PC client has been silent for > 3000ms, broadcast standby beacon (host_status = KVM_HOST_STANDBY)
+        if (last_uart_rx_time == 0 || (now - last_uart_rx_time > 3000)) {
+            kvm_heartbeat_packet_t hb;
+            hb.magic = KVM_ESPNOW_MAGIC;
+            hb.pkt_type = KVM_PKT_HEARTBEAT;
+            hb.host_status = KVM_HOST_STANDBY; // 0x00: Dongle powered on, PC app not running
+            hb.uptime_ms = now;
+            hb.seq_num = packet_seq++;
+
+            send_raw_packet(&hb, sizeof(hb));
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
 
 static void init_uart()
 {
@@ -231,6 +249,7 @@ static void serial_bridge_task(void *pvParameters)
     while (1) {
         int len = uart_read_bytes(UART_PORT, rx_buf + rx_len, sizeof(rx_buf) - rx_len, pdMS_TO_TICKS(1));
         if (len > 0) {
+            last_uart_rx_time = esp_log_timestamp();
             rx_len += len;
 
             while (rx_len >= 2) {
@@ -336,6 +355,7 @@ static void init_espnow_transmitter()
     ESP_LOGI(TAG, "Initializing ESP-NOW...");
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_espnow_sent));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
 
     // Register broadcast peer
     esp_now_peer_info_t peer_info = {};

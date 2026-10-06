@@ -16,6 +16,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/evdev"
+	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/protocol"
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/transport"
 )
 
@@ -66,6 +67,9 @@ type GUIApp struct {
 	// Slim Compact Footer
 	devSummaryText *canvas.Text
 
+	lastCardputerSeen time.Time
+	latestTelem       *protocol.TelemetryPacket
+
 	missedHandshakes int
 	heartBeatTick    int
 	isUpdatingUI     bool
@@ -88,6 +92,7 @@ func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
 		isDarkMode: false, // Default to light mode
 	}
 
+	g.hookTransport(trans)
 	g.buildUI()
 	g.startConnectionMonitor()
 	return g
@@ -225,13 +230,13 @@ func (g *GUIApp) buildUI() {
 	)
 
 	// --- Section 2: Compact Status & Telemetry Card with Cardputer Battery Donut ---
-	g.batteryDonut = NewBatteryDonut(36, "X", isInitOK, g.isDarkMode)
+	g.batteryDonut = NewBatteryDonut(36, "X", false, g.isDarkMode)
 
 	battTitle := widget.NewLabelWithStyle("Cardputer Battery", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
-	battSub := "Firmware pending"
-	if !isInitOK {
-		battSub = "Cardputer offline"
+	battSub := "Cardputer offline"
+	if isInitOK {
+		battSub = "Connecting to Cardputer..."
 	}
 	g.batterySubLabel = widget.NewLabel(battSub)
 
@@ -242,12 +247,12 @@ func (g *GUIApp) buildUI() {
 
 	sigStr := "📶 Offline"
 	if isInitOK {
-		sigStr = "📶 98% (-46 dBm)"
+		sigStr = "📶 Scanning..."
 	}
 	g.signalLabel = widget.NewLabel(sigStr)
 	g.signalLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	g.latencyLabel = widget.NewLabel("⚡ < 1 ms")
+	g.latencyLabel = widget.NewLabel("⚡ -- ms")
 
 	g.txStatsLabel = widget.NewLabel("▲ TX: 0 pkts (0 B)")
 	g.rxStatsLabel = widget.NewLabel("▼ RX: 0 pkts (0 B)")
@@ -388,17 +393,11 @@ func (g *GUIApp) reconnectSerial() {
 	if g.grabber != nil {
 		g.grabber.SetTransport(t)
 	}
+	g.hookTransport(t)
 
 	if verified, _ := t.VerifyHandshake(); verified {
 		if g.pulseDot != nil {
 			g.pulseDot.SetConnected(true)
-			g.pulseDot.Pulse()
-		}
-		if g.batteryDonut != nil {
-			g.batteryDonut.SetOnline(true)
-		}
-		if g.batterySubLabel != nil {
-			g.batterySubLabel.SetText("Firmware pending")
 		}
 		if g.connStatusText != nil {
 			g.connStatusText.Text = "Connected (ESP32-S3)"
@@ -436,10 +435,74 @@ func (g *GUIApp) startConnectionMonitor() {
 	}()
 }
 
+func (g *GUIApp) hookTransport(t transport.Transport) {
+	if t != nil {
+		t.SetOnTelemetry(func(telem *protocol.TelemetryPacket, rtt time.Duration) {
+			g.mu.Lock()
+			g.lastCardputerSeen = time.Now()
+			g.latestTelem = telem
+			g.mu.Unlock()
+
+			fyne.Do(func() {
+				g.handleTelemetryUpdate(telem, rtt)
+			})
+		})
+	}
+}
+
+func (g *GUIApp) handleTelemetryUpdate(telem *protocol.TelemetryPacket, rtt time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// 1. Confirmed life from Cardputer: trigger animated heartbeat pulse on dot!
+	if g.pulseDot != nil {
+		g.pulseDot.SetConnected(true)
+		g.pulseDot.Pulse()
+	}
+
+	// 2. Update Battery Donut
+	if g.batteryDonut != nil {
+		g.batteryDonut.SetOnline(true)
+		g.batteryDonut.SetValue(fmt.Sprintf("%d%%", telem.BatteryPct), float64(telem.BatteryPct)/100.0)
+	}
+
+	// 3. Update Target USB Status & Voltage
+	if g.batterySubLabel != nil {
+		usbStatus := "⚪ Target USB Unplugged"
+		if telem.USBMounted == 1 {
+			usbStatus = "🟢 Target USB Active"
+		}
+		volts := float64(telem.BatteryMv) / 1000.0
+		g.batterySubLabel.SetText(fmt.Sprintf("%.2f V  │  %s", volts, usbStatus))
+	}
+
+	// 4. Update RF Signal (dBm converted to percentage)
+	if g.signalLabel != nil {
+		rssiPct := 0
+		if telem.RSSI >= -50 {
+			rssiPct = 100
+		} else if telem.RSSI <= -100 {
+			rssiPct = 0
+		} else {
+			rssiPct = int(2 * (int(telem.RSSI) + 100))
+		}
+		g.signalLabel.SetText(fmt.Sprintf("📶 %d%% (%d dBm)", rssiPct, telem.RSSI))
+	}
+
+	// 5. Update Latency
+	if g.latencyLabel != nil {
+		if rtt > 0 {
+			g.latencyLabel.SetText(fmt.Sprintf("⚡ %.1f ms", float64(rtt.Microseconds())/1000.0))
+		}
+	}
+}
+
 // sendHeartbeatAndPulse transmits periodic KVM_PKT_HEARTBEAT packets to keep the Cardputer aware
 func (g *GUIApp) sendHeartbeatAndPulse() {
 	g.mu.Lock()
 	trans := g.trans
+	isEngaged := (g.grabber != nil && g.grabber.IsGrabbed())
+	isCardputerAlive := (!g.lastCardputerSeen.IsZero() && time.Since(g.lastCardputerSeen) < 2500*time.Millisecond)
 	g.mu.Unlock()
 
 	if trans == nil || !trans.IsConnected() {
@@ -452,6 +515,30 @@ func (g *GUIApp) sendHeartbeatAndPulse() {
 			}
 			if g.batteryDonut != nil {
 				g.batteryDonut.SetOnline(false)
+				g.batteryDonut.SetValue("X", 0.0)
+			}
+			if g.batterySubLabel != nil {
+				g.batterySubLabel.SetText("Dongle disconnected")
+			}
+			if g.signalLabel != nil {
+				g.signalLabel.SetText("📶 Offline")
+			}
+			if g.latencyLabel != nil {
+				g.latencyLabel.SetText("⚡ -- ms")
+			}
+		})
+		return
+	}
+
+	// Watchdog: If no telemetry received for > 2.5s, declare Cardputer offline
+	if !isCardputerAlive {
+		fyne.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+
+			if g.batteryDonut != nil {
+				g.batteryDonut.SetOnline(false)
+				g.batteryDonut.SetValue("X", 0.0)
 			}
 			if g.batterySubLabel != nil {
 				g.batterySubLabel.SetText("Cardputer offline")
@@ -459,39 +546,25 @@ func (g *GUIApp) sendHeartbeatAndPulse() {
 			if g.signalLabel != nil {
 				g.signalLabel.SetText("📶 Offline")
 			}
+			if g.latencyLabel != nil {
+				g.latencyLabel.SetText("⚡ -- ms")
+			}
 		})
-		return
 	}
 
-	// Transmit heartbeat over wire to transmitter -> beamed over ESP-NOW to Cardputer receiver!
-	_ = trans.SendHeartbeat()
+	// Transmit heartbeat query over wire -> dongle beams to Cardputer receiver!
+	_ = trans.SendHeartbeat(isEngaged)
 
-	fyne.Do(func() {
-		g.mu.Lock()
-		g.heartBeatTick++
-		g.mu.Unlock()
-
-		if g.pulseDot != nil {
-			g.pulseDot.SetConnected(true)
-			g.pulseDot.Pulse()
-		}
-		if g.batteryDonut != nil {
-			g.batteryDonut.SetOnline(true)
-			g.batteryDonut.SetValue("X", 0.0)
-		}
-		if g.batterySubLabel != nil {
-			g.batterySubLabel.SetText("Firmware pending")
-		}
-		if g.signalLabel != nil {
-			g.signalLabel.SetText("📶 98% (-46 dBm)")
-		}
-	})
+	g.mu.Lock()
+	g.heartBeatTick++
+	g.mu.Unlock()
 }
 
 // updateTelemetryUI updates live Sent/Received packets, bytes, and latency metrics
 func (g *GUIApp) updateTelemetryUI() {
 	g.mu.Lock()
 	trans := g.trans
+	isCardputerAlive := (!g.lastCardputerSeen.IsZero() && time.Since(g.lastCardputerSeen) < 2500*time.Millisecond)
 	g.mu.Unlock()
 
 	var stats transport.TransportStats
@@ -510,11 +583,11 @@ func (g *GUIApp) updateTelemetryUI() {
 			g.rxStatsLabel.SetText(fmt.Sprintf("▼ RX: %s pkts (%s)", formatCount(stats.PacketsRecv), formatBytes(stats.BytesRecv)))
 		}
 		if g.latencyLabel != nil {
-			lat := "< 1 ms"
-			if stats.Latency > 0 {
-				lat = fmt.Sprintf("%.1f ms", float64(stats.Latency.Microseconds())/1000.0)
+			if !isCardputerAlive || stats.Latency == 0 {
+				g.latencyLabel.SetText("⚡ -- ms")
+			} else {
+				g.latencyLabel.SetText(fmt.Sprintf("⚡ %.1f ms", float64(stats.Latency.Microseconds())/1000.0))
 			}
-			g.latencyLabel.SetText(fmt.Sprintf("⚡ %s", lat))
 		}
 	})
 }
@@ -524,30 +597,7 @@ func (g *GUIApp) checkConnectionStatus() {
 	trans := g.trans
 	g.mu.Unlock()
 
-	isOK := false
-	if trans != nil && trans.IsConnected() {
-		verified, _ := trans.VerifyHandshake()
-		if verified {
-			g.mu.Lock()
-			g.missedHandshakes = 0
-			g.mu.Unlock()
-			isOK = true
-		} else {
-			g.mu.Lock()
-			g.missedHandshakes++
-			if g.missedHandshakes < 3 {
-				isOK = true
-			} else {
-				_ = trans.Close()
-				g.trans = nil
-				if g.grabber != nil {
-					g.grabber.SetTransport(nil)
-				}
-				isOK = false
-			}
-			g.mu.Unlock()
-		}
-	}
+	isOK := (trans != nil && trans.IsConnected())
 
 	// If currently disconnected, auto-detect a connected or re-plugged dongle
 	if !isOK {
@@ -561,6 +611,7 @@ func (g *GUIApp) checkConnectionStatus() {
 						g.grabber.SetTransport(t)
 					}
 					g.mu.Unlock()
+					g.hookTransport(t)
 					isOK = true
 
 					fyne.Do(func() {

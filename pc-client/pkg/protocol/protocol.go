@@ -14,6 +14,14 @@ const (
 	PktTypeHeartbeat = uint8(0x03)
 	PktTypePingReq   = uint8(0x04)
 	PktTypePingResp  = uint8(0x05)
+	PktTypeTelemetry = uint8(0x06)
+)
+
+// Host State Flags carried in HeartbeatPacket
+const (
+	HostStatusStandby   = uint8(0x00) // Dongle powered on, PC app not running
+	HostStatusConnected = uint8(0x01) // PC app active & linked
+	HostStatusEngaged   = uint8(0x02) // PC app KVM grab active (Scroll Lock)
 )
 
 // Keyboard Modifiers (Standard USB HID)
@@ -157,12 +165,13 @@ const (
 	MouseBtnMiddle = byte(0x04)
 )
 
-// HeartbeatPacket represents the 9-byte wire format matching kvm_heartbeat_packet_t
+// HeartbeatPacket represents the 10-byte wire format matching kvm_heartbeat_packet_t
 type HeartbeatPacket struct {
-	Magic    uint16 // 0x4B56
-	PktType  uint8  // 0x03
-	UptimeMs uint32 // Client uptime or timestamp
-	SeqNum   uint16
+	Magic      uint16 // 0x4B56
+	PktType    uint8  // 0x03
+	HostStatus uint8  // HostStatusStandby, HostStatusConnected, HostStatusEngaged
+	UptimeMs   uint32 // Client uptime or timestamp
+	SeqNum     uint16
 }
 
 // EncodeMousePacket serializes a relative mouse motion/click report into 9 bytes
@@ -202,13 +211,14 @@ func EncodeRelease(seq uint16) []byte {
 	return EncodeKeyPacket(0, keys, seq)
 }
 
-// EncodeHeartbeat serializes a heartbeat ping packet
-func EncodeHeartbeat(uptimeMs uint32, seq uint16) []byte {
-	buf := make([]byte, 9)
+// EncodeHeartbeat serializes a 10-byte heartbeat ping packet
+func EncodeHeartbeat(hostStatus uint8, uptimeMs uint32, seq uint16) []byte {
+	buf := make([]byte, 10)
 	binary.LittleEndian.PutUint16(buf[0:2], Magic)
 	buf[2] = PktTypeHeartbeat
-	binary.LittleEndian.PutUint32(buf[3:7], uptimeMs)
-	binary.LittleEndian.PutUint16(buf[7:9], seq)
+	buf[3] = hostStatus
+	binary.LittleEndian.PutUint32(buf[4:8], uptimeMs)
+	binary.LittleEndian.PutUint16(buf[8:10], seq)
 	return buf
 }
 
@@ -262,6 +272,42 @@ func ParsePingResp(buf []byte) (*PingRespPacket, error) {
 	resp.DeviceID = string(devIDBytes[:nullIdx])
 	resp.SeqNum = binary.LittleEndian.Uint16(buf[25:27])
 	return &resp, nil
+}
+
+// TelemetryPacket represents the 12-byte wire format matching kvm_telemetry_packet_t
+type TelemetryPacket struct {
+	Magic      uint16 // 0x4B56
+	PktType    uint8  // 0x06 (PktTypeTelemetry)
+	BatteryPct uint8  // 0 - 100%
+	BatteryMv  uint16 // Battery millivolts (e.g. 4120 mV)
+	RSSI       int8   // Received signal strength (dBm)
+	USBMounted uint8  // 1 = Target host USB active, 0 = Unplugged/idle
+	EchoSeq    uint16 // Echo of last received Heartbeat seq_num (for RTT calculation)
+	SeqNum     uint16 // Telemetry sequence counter
+}
+
+// ParseTelemetry attempts to decode a 12-byte telemetry packet from raw bytes
+func ParseTelemetry(buf []byte) (*TelemetryPacket, error) {
+	if len(buf) < 12 {
+		return nil, fmt.Errorf("buffer too short for telemetry packet: got %d bytes, want 12", len(buf))
+	}
+	magic := binary.LittleEndian.Uint16(buf[0:2])
+	if magic != Magic {
+		return nil, fmt.Errorf("invalid magic: 0x%04X", magic)
+	}
+	if buf[2] != PktTypeTelemetry {
+		return nil, fmt.Errorf("invalid packet type: 0x%02X, want 0x06", buf[2])
+	}
+	return &TelemetryPacket{
+		Magic:      magic,
+		PktType:    buf[2],
+		BatteryPct: buf[3],
+		BatteryMv:  binary.LittleEndian.Uint16(buf[4:6]),
+		RSSI:       int8(buf[6]),
+		USBMounted: buf[7],
+		EchoSeq:    binary.LittleEndian.Uint16(buf[8:10]),
+		SeqNum:     binary.LittleEndian.Uint16(buf[10:12]),
+	}, nil
 }
 
 // CharToHID converts an ASCII character to a HID keycode and shift modifier

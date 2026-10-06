@@ -42,6 +42,15 @@ static char remote_mac_str[18] = "None";
 static uint32_t last_remote_packet_time = 0;
 static bool remote_linked = false;
 
+// Remote Transmitter Address & Telemetry State
+static uint8_t s_transmitter_mac[6] = {0};
+static bool s_transmitter_peer_registered = false;
+static int8_t s_last_rssi = -60;
+static uint8_t s_last_host_status = KVM_HOST_STANDBY;
+static uint16_t s_pending_echo_seq = 0;
+static uint16_t s_telemetry_seq = 0;
+static TaskHandle_t s_telemetry_task_handle = NULL;
+
 // Live Input Activity & Visual Feedback Tracking
 static uint32_t last_kbd_event_time = 0;
 static uint8_t  last_kbd_mod = 0;
@@ -327,8 +336,42 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
         s_mouse_state.dirty = true;
         portEXIT_CRITICAL(&s_mouse_state.mux);
     }
-    else if (pkt_type == KVM_PKT_HEARTBEAT) {
-        ESP_LOGD(TAG, "[%s] Heartbeat received", source_tag);
+    else if (pkt_type == KVM_PKT_HEARTBEAT && len >= sizeof(kvm_heartbeat_packet_t)) {
+        const kvm_heartbeat_packet_t *hb = (const kvm_heartbeat_packet_t*)data;
+        s_last_host_status = hb->host_status;
+        s_pending_echo_seq = hb->seq_num;
+        ESP_LOGD(TAG, "[%s] Heartbeat received: host_status=%d, seq=%u", source_tag, hb->host_status, hb->seq_num);
+        if (s_telemetry_task_handle != NULL) {
+            xTaskNotifyGive(s_telemetry_task_handle);
+        }
+    }
+}
+
+// Telemetry Task: Safely reads battery & USB status in FreeRTOS task context and sends ACK over ESP-NOW
+static void telemetry_task(void *pvParameters)
+{
+    while (1) {
+        // Wait for heartbeat notification (or 2000ms periodic timeout fallback)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+
+        if (s_transmitter_peer_registered) {
+            kvm_telemetry_packet_t telem = {};
+            telem.magic = KVM_ESPNOW_MAGIC;
+            telem.pkt_type = KVM_PKT_TELEMETRY;
+
+            int batt = M5.Power.getBatteryLevel();
+            telem.battery_pct = (batt < 0) ? 0 : (batt > 100 ? 100 : (uint8_t)batt);
+
+            int16_t mv = M5.Power.getBatteryVoltage();
+            telem.battery_mv = (mv < 0) ? 0 : (uint16_t)mv;
+
+            telem.rssi = s_last_rssi;
+            telem.usb_mounted = tusb_hid_device_helper_is_mounted() ? 1 : 0;
+            telem.echo_seq = s_pending_echo_seq;
+            telem.seq_num = s_telemetry_seq++;
+
+            esp_now_send(s_transmitter_mac, (const uint8_t*)&telem, sizeof(telem));
+        }
     }
 }
 
@@ -339,6 +382,22 @@ static void on_espnow_recv(const esp_now_recv_info_t *recv_info, const uint8_t *
     snprintf(remote_mac_str, sizeof(remote_mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
              recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
              recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+
+    // Dynamically register transmitter peer for unicast telemetry responses
+    if (!esp_now_is_peer_exist(recv_info->src_addr)) {
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, recv_info->src_addr, 6);
+        peer.channel = KVM_ESPNOW_CHANNEL;
+        peer.ifidx = WIFI_IF_STA;
+        peer.encrypt = false;
+        esp_now_add_peer(&peer);
+    }
+    memcpy(s_transmitter_mac, recv_info->src_addr, 6);
+    s_transmitter_peer_registered = true;
+    if (recv_info->rx_ctrl != NULL) {
+        s_last_rssi = recv_info->rx_ctrl->rssi;
+    }
+
     process_kvm_packet(data, len, "ESP-NOW");
 }
 
@@ -492,9 +551,27 @@ static void draw_heart_icon(LovyanGFX &gfx, int hx, int hy, bool linked, bool is
     }
 }
 
-static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked, bool is_beat)
+static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked, bool is_beat, uint8_t host_status)
 {
-    uint16_t col = linked ? 0x07FF : 0x7BEF; // Neon Cyan : Slate Gray
+    uint16_t col = 0x7BEF; // Default Slate Gray (scanning)
+    const char *status_text = "RF SCAN";
+    bool animate_heart = false;
+
+    if (linked) {
+        if (host_status == KVM_HOST_ENGAGED) {
+            col = 0x07E0; // Neon Green
+            status_text = "RF:ENGAGED";
+            animate_heart = is_beat;
+        } else if (host_status == KVM_HOST_CONNECTED) {
+            col = 0x07FF; // Neon Cyan
+            status_text = "RF:READY";
+            animate_heart = is_beat;
+        } else {
+            col = 0xFD20; // Amber / Orange
+            status_text = "RF:STANDBY";
+            animate_heart = false; // Heart resting in standby
+        }
+    }
 
     // Central antenna mast
     gfx.drawFastVLine(x + 6, y + 6, 6, col);
@@ -508,7 +585,7 @@ static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked, bool is_beat
     gfx.drawPixel(x + 9, y + 3, col);
 
     // Outer radiating waves (glows bright when pulsing)
-    uint16_t outer_col = (linked && is_beat) ? 0xFFFF : col;
+    uint16_t outer_col = (linked && animate_heart) ? 0xFFFF : col;
     gfx.drawPixel(x + 0, y + 3, outer_col);
     gfx.drawPixel(x + 1, y + 1, outer_col);
     gfx.drawFastHLine(x + 3, y - 1, 7, outer_col);
@@ -517,10 +594,11 @@ static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked, bool is_beat
 
     // Text label
     gfx.setTextColor(col, 0x10A2);
-    gfx.drawString(linked ? "RF LINK" : "RF SCAN", x + 16, y + 3);
+    gfx.drawString(status_text, x + 16, y + 3);
 
-    // Beating Heart (placed right next to RF LINK text at x + 63, y + 2)
-    draw_heart_icon(gfx, x + 63, y + 2, linked, is_beat);
+    int text_w = gfx.textWidth(status_text);
+    // Beating Heart (placed right after status text)
+    draw_heart_icon(gfx, x + 16 + text_w + 3, y + 2, linked, animate_heart);
 }
 
 static void draw_battery_icon(LovyanGFX &gfx, int x, int y, int batt_level)
@@ -743,7 +821,7 @@ static void update_display(bool force)
     draw_usb_icon(gfx, 6, 4, current_mounted);
 
     // RF Icon with Beating Heart (x: 76, y: 4)
-    draw_rf_icon(gfx, 76, 4, is_rf_alive, is_heart_beating);
+    draw_rf_icon(gfx, 76, 4, is_rf_alive, is_heart_beating, s_last_host_status);
 
     // Battery Icon (x: 204, y: 5)
     draw_battery_icon(gfx, 204, 5, current_batt);
@@ -815,6 +893,9 @@ extern "C" void app_main(void)
 
     // 5. Initialize Pure ESP-NOW Receiver
     init_espnow_receiver();
+
+    // Start Telemetry Task
+    xTaskCreatePinnedToCore(telemetry_task, "kvm_telem", 3072, NULL, 4, &s_telemetry_task_handle, 0);
 
     // 6. Hook Local Keyboard Event Callback
     keyboard.onKeyEvent.connect([](const Keyboard::KeyEvent_t& keyEvent) {

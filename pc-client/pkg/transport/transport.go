@@ -31,7 +31,9 @@ type Transport interface {
 	SendReport(modifier byte, keycodes [6]byte) error
 	SendRelease() error
 	SendMouse(buttons byte, dx, dy, wheel int8) error
-	SendHeartbeat() error
+	SendHeartbeat(isEngaged bool) error
+	SetOnTelemetry(cb func(telem *protocol.TelemetryPacket, rtt time.Duration))
+	LatestTelemetry() (*protocol.TelemetryPacket, time.Time)
 	SendString(s string, charDelay time.Duration) error
 	SendStringFast(text string, cancel <-chan struct{}, onProgress func(done, total int)) error
 	Close() error
@@ -47,13 +49,25 @@ type Transport interface {
 // =====================================================================
 
 type SerialTransport struct {
-	portName  string
-	baudRate  int
-	port      serial.Port
-	seq       uint16
-	stats     TransportStats
-	mu        sync.Mutex
-	connected bool
+	portName        string
+	baudRate        int
+	port            serial.Port
+	seq             uint16
+	stats           TransportStats
+	mu              sync.Mutex
+	connected       bool
+	closeChan       chan struct{}
+
+	heartbeatMu     sync.Mutex
+	heartbeatTimes  map[uint16]time.Time
+
+	pingRespChan    chan *protocol.PingRespPacket
+
+	latestTelem     *protocol.TelemetryPacket
+	latestTelemTime time.Time
+
+	cbMu            sync.Mutex
+	onTelemetry     func(telem *protocol.TelemetryPacket, rtt time.Duration)
 }
 
 // drainSerialPort reads and discards pending bytes in the serial RX buffer until idle
@@ -200,12 +214,149 @@ func NewSerialTransport(portName string, baudRate int) (*SerialTransport, error)
 		return nil, fmt.Errorf("failed to open serial port %s: %w", portName, err)
 	}
 
-	return &SerialTransport{
-		portName:  portName,
-		baudRate:  baudRate,
-		port:      p,
-		connected: true,
-	}, nil
+	s := &SerialTransport{
+		portName:       portName,
+		baudRate:       baudRate,
+		port:           p,
+		connected:      true,
+		closeChan:      make(chan struct{}),
+		heartbeatTimes: make(map[uint16]time.Time),
+		pingRespChan:   make(chan *protocol.PingRespPacket, 4),
+	}
+
+	go s.readLoop()
+	return s, nil
+}
+
+// readLoop continuously reads and demuxes incoming serial packets (ping responses and telemetry)
+func (s *SerialTransport) readLoop() {
+	buf := make([]byte, 1024)
+	rxBuf := make([]byte, 0, 2048)
+
+	for {
+		s.mu.Lock()
+		p := s.port
+		conn := s.connected
+		s.mu.Unlock()
+
+		if p == nil || !conn {
+			return
+		}
+
+		_ = p.SetReadTimeout(100 * time.Millisecond)
+		n, err := p.Read(buf)
+		if err != nil {
+			s.mu.Lock()
+			if s.connected {
+				s.connected = false
+				s.stats.Errors++
+			}
+			s.mu.Unlock()
+			return
+		}
+
+		select {
+		case <-s.closeChan:
+			return
+		default:
+		}
+
+		if n > 0 {
+			s.mu.Lock()
+			s.stats.BytesRecv += uint64(n)
+			s.stats.LastRecv = time.Now()
+			s.mu.Unlock()
+
+			rxBuf = append(rxBuf, buf[:n]...)
+
+			for len(rxBuf) >= 2 {
+				magic := binary.LittleEndian.Uint16(rxBuf[0:2])
+				if magic != protocol.Magic {
+					drop := 1
+					for drop+1 < len(rxBuf) {
+						if binary.LittleEndian.Uint16(rxBuf[drop:drop+2]) == protocol.Magic {
+							break
+						}
+						drop++
+					}
+					rxBuf = rxBuf[drop:]
+					continue
+				}
+
+				if len(rxBuf) < 3 {
+					break
+				}
+
+				pktType := rxBuf[2]
+				var pktSize int
+				switch pktType {
+				case protocol.PktTypePingResp:
+					pktSize = 27
+				case protocol.PktTypeTelemetry:
+					pktSize = 12
+				default:
+					rxBuf = rxBuf[1:]
+					continue
+				}
+
+				if len(rxBuf) < pktSize {
+					break
+				}
+
+				pktData := rxBuf[:pktSize]
+
+				switch pktType {
+				case protocol.PktTypePingResp:
+					if resp, err := protocol.ParsePingResp(pktData); err == nil {
+						s.mu.Lock()
+						s.stats.PacketsRecv++
+						s.mu.Unlock()
+						select {
+						case s.pingRespChan <- resp:
+						default:
+						}
+					}
+				case protocol.PktTypeTelemetry:
+					if telem, err := protocol.ParseTelemetry(pktData); err == nil {
+						now := time.Now()
+						s.mu.Lock()
+						s.stats.PacketsRecv++
+						s.latestTelem = telem
+						s.latestTelemTime = now
+						s.mu.Unlock()
+
+						var rtt time.Duration
+						s.heartbeatMu.Lock()
+						if sentTime, ok := s.heartbeatTimes[telem.EchoSeq]; ok {
+							rtt = now.Sub(sentTime)
+							delete(s.heartbeatTimes, telem.EchoSeq)
+							for oldSeq, t := range s.heartbeatTimes {
+								if now.Sub(t) > 5*time.Second {
+									delete(s.heartbeatTimes, oldSeq)
+								}
+							}
+						}
+						s.heartbeatMu.Unlock()
+
+						if rtt > 0 {
+							s.mu.Lock()
+							s.stats.Latency = rtt
+							s.mu.Unlock()
+						}
+
+						s.cbMu.Lock()
+						cb := s.onTelemetry
+						s.cbMu.Unlock()
+						if cb != nil {
+							cb(telem, rtt)
+						}
+					}
+				}
+
+				rxBuf = rxBuf[pktSize:]
+			}
+		}
+	}
 }
 
 func (s *SerialTransport) Send(data []byte) error {
@@ -216,7 +367,6 @@ func (s *SerialTransport) Send(data []byte) error {
 		return fmt.Errorf("serial port %s not connected", s.portName)
 	}
 
-	start := time.Now()
 	n, err := s.port.Write(data)
 	if err != nil {
 		s.stats.Errors++
@@ -227,7 +377,6 @@ func (s *SerialTransport) Send(data []byte) error {
 	s.stats.PacketsSent++
 	s.stats.BytesSent += uint64(n)
 	s.stats.LastSent = time.Now()
-	s.stats.Latency = time.Since(start)
 	return nil
 }
 
@@ -287,14 +436,29 @@ func (s *SerialTransport) SendMouse(buttons byte, dx, dy, wheel int8) error {
 	return nil
 }
 
-func (s *SerialTransport) SendHeartbeat() error {
+func (s *SerialTransport) SendHeartbeat(isEngaged bool) error {
 	s.mu.Lock()
 	s.seq++
 	seq := s.seq
-	uptime := uint32(time.Now().UnixMilli())
 	s.mu.Unlock()
 
-	pkt := protocol.EncodeHeartbeat(uptime, seq)
+	hostStatus := protocol.HostStatusConnected
+	if isEngaged {
+		hostStatus = protocol.HostStatusEngaged
+	}
+
+	now := time.Now()
+	s.heartbeatMu.Lock()
+	s.heartbeatTimes[seq] = now
+	for oldSeq, t := range s.heartbeatTimes {
+		if now.Sub(t) > 5*time.Second {
+			delete(s.heartbeatTimes, oldSeq)
+		}
+	}
+	s.heartbeatMu.Unlock()
+
+	uptime := uint32(now.UnixMilli())
+	pkt := protocol.EncodeHeartbeat(hostStatus, uptime, seq)
 	return s.Send(pkt)
 }
 
@@ -379,7 +543,11 @@ func (s *SerialTransport) SendStringFast(text string, cancel <-chan struct{}, on
 func (s *SerialTransport) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.connected {
+		return nil
+	}
 	s.connected = false
+	close(s.closeChan)
 	if s.port != nil {
 		err := s.port.Close()
 		s.port = nil
@@ -396,55 +564,51 @@ func (s *SerialTransport) IsConnected() bool {
 
 // VerifyHandshake sends a ping request over the open serial transport to verify transmitter identity
 func (s *SerialTransport) VerifyHandshake() (bool, string) {
+	if !s.IsConnected() {
+		return false, ""
+	}
+
+	// Drain any residual ping responses from channel
+	for {
+		select {
+		case <-s.pingRespChan:
+		default:
+			goto drained
+		}
+	}
+drained:
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.port == nil || !s.connected {
-		return false, ""
-	}
-
-	// Drain any leftover telemetry / logs before pinging
-	drainSerialPort(s.port, 15*time.Millisecond)
-
-	_ = s.port.SetReadTimeout(30 * time.Millisecond)
-
 	s.seq++
-	req := protocol.EncodePingReq(s.seq)
-	if _, err := s.port.Write(req); err != nil {
-		s.connected = false
+	seq := s.seq
+	s.mu.Unlock()
+
+	req := protocol.EncodePingReq(seq)
+	if err := s.Send(req); err != nil {
 		return false, ""
 	}
 
-	buf := make([]byte, 512)
-	readBytes := 0
-	deadline := time.Now().Add(300 * time.Millisecond)
-
-	for time.Now().Before(deadline) && readBytes < len(buf)-27 {
-		n, err := s.port.Read(buf[readBytes:])
-		if err != nil {
-			// Real I/O error
-			s.connected = false
-			return false, ""
+	select {
+	case resp := <-s.pingRespChan:
+		if resp != nil && resp.DeviceID == "KVM_TRANSMITTER" {
+			return true, resp.DeviceID
 		}
-		if n > 0 {
-			readBytes += n
-			s.stats.BytesRecv += uint64(n)
-			for i := 0; i <= readBytes-27; i++ {
-				magic := binary.LittleEndian.Uint16(buf[i : i+2])
-				if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
-					parsed, err := protocol.ParsePingResp(buf[i : i+27])
-					if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
-						s.stats.PacketsRecv++
-						s.stats.LastRecv = time.Now()
-						drainSerialPort(s.port, 10*time.Millisecond)
-						return true, parsed.DeviceID
-					}
-				}
-			}
-		}
+	case <-time.After(250 * time.Millisecond):
 	}
 
 	return false, ""
+}
+
+func (s *SerialTransport) SetOnTelemetry(cb func(telem *protocol.TelemetryPacket, rtt time.Duration)) {
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	s.onTelemetry = cb
+}
+
+func (s *SerialTransport) LatestTelemetry() (*protocol.TelemetryPacket, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.latestTelem, s.latestTelemTime
 }
 
 func (s *SerialTransport) Stats() TransportStats {

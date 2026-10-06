@@ -225,19 +225,45 @@ static void _demo_app_main(void)
     ESP_LOGI(TAG, "USB initialization DONE");
 }
 
+// TinyUSB lifecycle callbacks
+void tud_mount_cb(void)
+{
+    ESP_LOGI(TAG, "TinyUSB Mount: Target Host Active & Enumerated");
+}
+
+void tud_umount_cb(void)
+{
+    ESP_LOGI(TAG, "TinyUSB Unmount: Target Host Disconnected");
+}
+
+void tud_suspend_cb(bool remote_wakeup_en)
+{
+    ESP_LOGI(TAG, "TinyUSB Suspend: Cable unplugged or Host asleep (remote_wakeup=%d)", remote_wakeup_en);
+}
+
+void tud_resume_cb(void)
+{
+    ESP_LOGI(TAG, "TinyUSB Resume: Target Host Active");
+}
+
 void tusb_hid_device_helper_init(void)
 {
     _demo_app_main();
 }
 
+bool tusb_hid_device_helper_is_mounted(void)
+{
+    return tud_mounted() && !tud_suspended();
+}
+
 bool tusb_hid_device_helper_ready(void)
 {
-    return tud_mounted() && (tud_hid_n_ready(ITF_NUM_KEYBOARD) || tud_hid_n_ready(ITF_NUM_MOUSE));
+    return tud_mounted() && !tud_suspended() && (tud_hid_n_ready(ITF_NUM_KEYBOARD) || tud_hid_n_ready(ITF_NUM_MOUSE));
 }
 
 bool tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
 {
-    if (!tud_mounted()) return false;
+    if (!tusb_hid_device_helper_is_mounted()) return false;
     int timeout_us = 5000;
     while (!tud_hid_n_ready(ITF_NUM_KEYBOARD) && timeout_us > 0) {
         esp_rom_delay_us(10);
@@ -248,7 +274,7 @@ bool tusb_hid_device_helper_report(uint8_t modifier, uint8_t *keycode)
 
 bool tusb_hid_device_helper_mouse_report(uint8_t buttons, int8_t x, int8_t y, int8_t vertical)
 {
-    if (!tud_mounted()) return false;
+    if (!tusb_hid_device_helper_is_mounted()) return false;
     int timeout_us = 2000;
     while (!tud_hid_n_ready(ITF_NUM_MOUSE) && timeout_us > 0) {
         esp_rom_delay_us(10);
@@ -259,11 +285,6 @@ bool tusb_hid_device_helper_mouse_report(uint8_t buttons, int8_t x, int8_t y, in
 
 bool tusb_hid_device_helper_mouse_report_nowait(uint8_t buttons, int8_t x, int8_t y, int8_t vertical)
 {
-    if (!tud_mounted() || !tud_hid_n_ready(ITF_NUM_MOUSE)) return false;
+    if (!tusb_hid_device_helper_is_mounted() || !tud_hid_n_ready(ITF_NUM_MOUSE)) return false;
     return tud_hid_n_mouse_report(ITF_NUM_MOUSE, 0, buttons, x, y, vertical, 0);
-}
-
-bool tusb_hid_device_helper_is_mounted(void)
-{
-    return tud_mounted();
 }

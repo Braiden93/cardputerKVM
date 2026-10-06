@@ -16,8 +16,11 @@ import (
 type TransportStats struct {
 	PacketsSent uint64
 	BytesSent   uint64
+	PacketsRecv uint64
+	BytesRecv   uint64
 	Errors      uint64
 	LastSent    time.Time
+	LastRecv    time.Time
 	Latency     time.Duration
 }
 
@@ -425,11 +428,14 @@ func (s *SerialTransport) VerifyHandshake() (bool, string) {
 		}
 		if n > 0 {
 			readBytes += n
+			s.stats.BytesRecv += uint64(n)
 			for i := 0; i <= readBytes-27; i++ {
 				magic := binary.LittleEndian.Uint16(buf[i : i+2])
 				if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
 					parsed, err := protocol.ParsePingResp(buf[i : i+27])
 					if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
+						s.stats.PacketsRecv++
+						s.stats.LastRecv = time.Now()
 						drainSerialPort(s.port, 10*time.Millisecond)
 						return true, parsed.DeviceID
 					}

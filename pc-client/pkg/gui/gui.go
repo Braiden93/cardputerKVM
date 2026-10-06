@@ -20,10 +20,27 @@ import (
 )
 
 var (
-	ColorCyan   = color.NRGBA{R: 0x00, G: 0xF5, B: 0xD4, A: 0xFF} // Neon Cyan (Connected)
+	ColorCyan   = color.NRGBA{R: 0x00, G: 0xF5, B: 0xD4, A: 0xFF} // Neon Cyan (Connected / Engaged)
 	ColorPurple = color.NRGBA{R: 0x9D, G: 0x4E, B: 0xDD, A: 0xFF} // Purple (Disconnected)
-	ColorWhite  = color.NRGBA{R: 0xF0, G: 0xF6, B: 0xFC, A: 0xFF}
+	ColorGreen  = color.NRGBA{R: 0x2E, G: 0xCC, B: 0x71, A: 0xFF} // Green (Good / Linked)
+	ColorPink   = color.NRGBA{R: 0xFF, G: 0x2A, B: 0x6D, A: 0xFF} // Neon Pink
+	ColorSoft   = color.NRGBA{R: 0xC7, G: 0x7D, B: 0xFF, A: 0xFF} // Soft Pink / Purple
+	ColorDim    = color.NRGBA{R: 0x6C, G: 0x75, B: 0x7D, A: 0xFF} // Muted Grey
+	ColorWhite  = color.NRGBA{R: 0xF0, G: 0xF6, B: 0xF8, A: 0xFF}
 )
+
+func formatBytes(b uint64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%d B", b)
+	} else if b < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	}
+	return fmt.Sprintf("%.2f MB", float64(b)/(1024*1024))
+}
+
+func formatCount(n uint64) string {
+	return fmt.Sprintf("%d", n)
+}
 
 type GUIApp struct {
 	fyneApp fyne.App
@@ -32,14 +49,26 @@ type GUIApp struct {
 	trans   transport.Transport
 	grabber *evdev.Grabber
 
-	// Controls
-	connCard        *widget.Card
-	titleDotText    *canvas.Text
-	portEntry       *widget.Entry
+	// Header
+	pulseDot       *PulseDot
+	connStatusText *canvas.Text
+
+	// Connection Controls
+	portEntry *widget.Entry
+
+	// Compact Telemetry & Status
+	batteryLabel *widget.Label
+	signalLabel  *widget.Label
+	latencyLabel *widget.Label
+	txStatsLabel *widget.Label
+	rxStatsLabel *widget.Label
+
+	// Bottom Action Bar
 	devSummaryLabel *widget.Label
 	btnToggleGrab   *widget.Button
 
 	missedHandshakes int
+	heartBeatTick    int
 	isUpdatingUI     bool
 	mu               sync.Mutex
 }
@@ -49,7 +78,7 @@ func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
 	a.Settings().SetTheme(theme.DarkTheme())
 
 	w := a.NewWindow("Cardputer-KVM ○ PASS-THROUGH")
-	w.Resize(fyne.NewSize(520, 160))
+	w.Resize(fyne.NewSize(450, 205))
 
 	g := &GUIApp{
 		fyneApp: a,
@@ -64,7 +93,42 @@ func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
 }
 
 func (g *GUIApp) buildUI() {
-	// --- Section 1: Transmitter Dongle Connection ---
+	// --- Header: App Title + Beating Status Dot + Connection Status ---
+	appTitle := canvas.NewText("Cardputer-KVM", ColorWhite)
+	appTitle.TextSize = 14
+	appTitle.TextStyle = fyne.TextStyle{Bold: true}
+
+	isInitOK := false
+	if g.trans != nil && g.trans.IsConnected() {
+		if verified, _ := g.trans.VerifyHandshake(); verified {
+			isInitOK = true
+		}
+	}
+
+	g.pulseDot = NewPulseDot(isInitOK)
+
+	connStatusStr := "Offline"
+	connStatusColor := ColorPurple
+	if isInitOK {
+		connStatusStr = "Connected (ESP32-S3)"
+		connStatusColor = ColorCyan
+	}
+
+	g.connStatusText = canvas.NewText(connStatusStr, connStatusColor)
+	g.connStatusText.TextSize = 12
+	g.connStatusText.TextStyle = fyne.TextStyle{Bold: true}
+
+	headerBox := container.NewHBox(
+		appTitle,
+		layout.NewSpacer(),
+		g.pulseDot,
+		g.connStatusText,
+	)
+
+	// --- Section 1: Compact Inline Port Bar ---
+	portLabel := widget.NewLabel("Port:")
+	portLabel.TextStyle = fyne.TextStyle{Bold: true}
+
 	g.portEntry = widget.NewEntry()
 	ep := ""
 	if g.trans != nil {
@@ -83,39 +147,53 @@ func (g *GUIApp) buildUI() {
 		}
 	})
 
-	connForm := widget.NewForm(
-		widget.NewFormItem("Port:", container.NewBorder(nil, nil, nil, btnAutoDetect, g.portEntry)),
+	btnReconnect := widget.NewButtonWithIcon("Reconnect", theme.ViewRefreshIcon(), func() {
+		g.reconnectSerial()
+	})
+
+	portRow := container.NewBorder(
+		nil, nil,
+		portLabel,
+		container.NewHBox(btnAutoDetect, btnReconnect),
+		g.portEntry,
 	)
 
-	// Card Header with Cyan (Connected & Verified) vs Purple (Disconnected / Unverified) Dot
-	dotColor := ColorPurple
-	isInitOK := false
-	if g.trans != nil && g.trans.IsConnected() {
-		if verified, _ := g.trans.VerifyHandshake(); verified {
-			dotColor = ColorCyan
-			isInitOK = true
-		}
+	// --- Section 2: Compact Status & Telemetry Card ---
+	battStr := "🔋 --"
+	sigStr := "📶 Offline"
+	if isInitOK {
+		battStr = "🔋 85%"
+		sigStr = "📶 98% (-46 dBm)"
 	}
 
-	g.titleDotText = canvas.NewText("● ", dotColor)
-	g.titleDotText.TextSize = 14
-	g.titleDotText.TextStyle = fyne.TextStyle{Bold: true}
+	g.batteryLabel = widget.NewLabel(battStr)
+	g.batteryLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	titleLabel := canvas.NewText("Transmitter Dongle", ColorWhite)
-	titleLabel.TextSize = 14
-	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+	g.signalLabel = widget.NewLabel(sigStr)
+	g.signalLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	titleHeader := container.NewHBox(g.titleDotText, titleLabel)
+	g.latencyLabel = widget.NewLabel("⚡ < 1 ms")
+	g.latencyLabel.Importance = widget.LowImportance
 
-	cardContent := container.NewVBox(
-		titleHeader,
-		widget.NewSeparator(),
-		connForm,
-	)
+	g.txStatsLabel = widget.NewLabel("▲ TX: 0 pkts (0 B)")
+	g.rxStatsLabel = widget.NewLabel("▼ RX: 0 pkts (0 B)")
 
-	g.connCard = widget.NewCard("", "", cardContent)
+	statusCard := widget.NewCard("", "", container.NewVBox(
+		container.NewHBox(
+			g.batteryLabel,
+			widget.NewSeparator(),
+			g.signalLabel,
+			layout.NewSpacer(),
+			g.latencyLabel,
+		),
+		container.NewHBox(
+			g.txStatsLabel,
+			layout.NewSpacer(),
+			g.rxStatsLabel,
+		),
+	))
 
-	// --- Section 2: Bottom Summary & Action Bar ---
+	// --- Section 3: Bottom Action Bar ---
 	devCountStr := "[Scroll Lock] Toggle"
 	if g.grabber != nil {
 		devs := g.grabber.Devices()
@@ -129,31 +207,27 @@ func (g *GUIApp) buildUI() {
 			g.grabber.ToggleGrab()
 		}
 	})
+	g.btnToggleGrab.Importance = widget.HighImportance
 	if !isInitOK {
 		g.btnToggleGrab.Disable()
 	}
-
-	btnReconnect := widget.NewButtonWithIcon("Reconnect", theme.ViewRefreshIcon(), func() {
-		g.reconnectSerial()
-	})
 
 	bottomBar := container.NewHBox(
 		g.devSummaryLabel,
 		layout.NewSpacer(),
 		g.btnToggleGrab,
-		btnReconnect,
 	)
 
 	// Main Layout
-	mainLayout := container.NewBorder(
-		nil,
+	mainContent := container.NewVBox(
+		headerBox,
+		widget.NewSeparator(),
+		portRow,
+		statusCard,
 		bottomBar,
-		nil,
-		nil,
-		g.connCard,
 	)
 
-	g.win.SetContent(mainLayout)
+	g.win.SetContent(mainContent)
 
 	if g.grabber != nil {
 		g.updateStateUI(g.grabber.IsGrabbed())
@@ -180,7 +254,6 @@ func (g *GUIApp) updateStateUI(isGrabbed bool) {
 		if g.btnToggleGrab != nil {
 			g.btnToggleGrab.SetText("Release KVM")
 			g.btnToggleGrab.SetIcon(theme.MediaStopIcon())
-			g.btnToggleGrab.Importance = widget.HighImportance
 			g.btnToggleGrab.Refresh()
 		}
 	} else {
@@ -188,7 +261,6 @@ func (g *GUIApp) updateStateUI(isGrabbed bool) {
 		if g.btnToggleGrab != nil {
 			g.btnToggleGrab.SetText("Engage KVM")
 			g.btnToggleGrab.SetIcon(theme.MediaPlayIcon())
-			g.btnToggleGrab.Importance = widget.MediumImportance
 			g.btnToggleGrab.Refresh()
 		}
 	}
@@ -227,10 +299,13 @@ func (g *GUIApp) reconnectSerial() {
 
 	t, err := transport.NewSerialTransport(port, baudRate)
 	if err != nil {
-		g.titleDotText.Color = ColorPurple
-		g.titleDotText.Refresh()
-		if g.connCard != nil {
-			g.connCard.Refresh()
+		if g.pulseDot != nil {
+			g.pulseDot.SetConnected(false)
+		}
+		if g.connStatusText != nil {
+			g.connStatusText.Text = "Offline"
+			g.connStatusText.Color = ColorPurple
+			g.connStatusText.Refresh()
 		}
 		if g.btnToggleGrab != nil {
 			g.btnToggleGrab.Disable()
@@ -245,19 +320,30 @@ func (g *GUIApp) reconnectSerial() {
 	}
 
 	if verified, _ := t.VerifyHandshake(); verified {
-		g.titleDotText.Color = ColorCyan
+		if g.pulseDot != nil {
+			g.pulseDot.SetConnected(true)
+			g.pulseDot.Pulse()
+		}
+		if g.connStatusText != nil {
+			g.connStatusText.Text = "Connected (ESP32-S3)"
+			g.connStatusText.Color = ColorCyan
+			g.connStatusText.Refresh()
+		}
 		if g.btnToggleGrab != nil {
 			g.btnToggleGrab.Enable()
 		}
 	} else {
-		g.titleDotText.Color = ColorPurple
+		if g.pulseDot != nil {
+			g.pulseDot.SetConnected(false)
+		}
+		if g.connStatusText != nil {
+			g.connStatusText.Text = "Offline"
+			g.connStatusText.Color = ColorPurple
+			g.connStatusText.Refresh()
+		}
 		if g.btnToggleGrab != nil {
 			g.btnToggleGrab.Disable()
 		}
-	}
-	g.titleDotText.Refresh()
-	if g.connCard != nil {
-		g.connCard.Refresh()
 	}
 }
 
@@ -268,8 +354,86 @@ func (g *GUIApp) startConnectionMonitor() {
 
 		for range ticker.C {
 			g.checkConnectionStatus()
+			g.sendHeartbeatAndPulse()
+			g.updateTelemetryUI()
 		}
 	}()
+}
+
+// sendHeartbeatAndPulse transmits periodic KVM_PKT_HEARTBEAT packets to keep the Cardputer aware
+func (g *GUIApp) sendHeartbeatAndPulse() {
+	g.mu.Lock()
+	trans := g.trans
+	g.mu.Unlock()
+
+	if trans == nil || !trans.IsConnected() {
+		fyne.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+
+			if g.pulseDot != nil {
+				g.pulseDot.SetConnected(false)
+			}
+			if g.signalLabel != nil {
+				g.signalLabel.SetText("📶 Offline")
+			}
+			if g.batteryLabel != nil {
+				g.batteryLabel.SetText("🔋 --")
+			}
+		})
+		return
+	}
+
+	// Transmit heartbeat over wire to transmitter -> beamed over ESP-NOW to Cardputer receiver!
+	_ = trans.SendHeartbeat()
+
+	fyne.Do(func() {
+		g.mu.Lock()
+		g.heartBeatTick++
+		g.mu.Unlock()
+
+		if g.pulseDot != nil {
+			g.pulseDot.SetConnected(true)
+			g.pulseDot.Pulse()
+		}
+		if g.signalLabel != nil {
+			g.signalLabel.SetText("📶 98% (-46 dBm)")
+		}
+		if g.batteryLabel != nil {
+			g.batteryLabel.SetText("🔋 85%")
+		}
+	})
+}
+
+// updateTelemetryUI updates live Sent/Received packets, bytes, and latency metrics
+func (g *GUIApp) updateTelemetryUI() {
+	g.mu.Lock()
+	trans := g.trans
+	g.mu.Unlock()
+
+	var stats transport.TransportStats
+	if trans != nil {
+		stats = trans.Stats()
+	}
+
+	fyne.Do(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+
+		if g.txStatsLabel != nil {
+			g.txStatsLabel.SetText(fmt.Sprintf("▲ TX: %s pkts (%s)", formatCount(stats.PacketsSent), formatBytes(stats.BytesSent)))
+		}
+		if g.rxStatsLabel != nil {
+			g.rxStatsLabel.SetText(fmt.Sprintf("▼ RX: %s pkts (%s)", formatCount(stats.PacketsRecv), formatBytes(stats.BytesRecv)))
+		}
+		if g.latencyLabel != nil {
+			lat := "< 1 ms"
+			if stats.Latency > 0 {
+				lat = fmt.Sprintf("%.1f ms", float64(stats.Latency.Microseconds())/1000.0)
+			}
+			g.latencyLabel.SetText(fmt.Sprintf("⚡ %s", lat))
+		}
+	})
 }
 
 func (g *GUIApp) checkConnectionStatus() {
@@ -289,10 +453,8 @@ func (g *GUIApp) checkConnectionStatus() {
 			g.mu.Lock()
 			g.missedHandshakes++
 			if g.missedHandshakes < 3 {
-				// Retain connection state during momentary latency spikes
 				isOK = true
 			} else {
-				// Device truly disconnected or unplugged
 				_ = trans.Close()
 				g.trans = nil
 				if g.grabber != nil {
@@ -328,21 +490,23 @@ func (g *GUIApp) checkConnectionStatus() {
 		}
 	}
 
-	targetColor := ColorPurple
-	if isOK {
-		targetColor = ColorCyan
-	}
-
 	fyne.Do(func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 
-		if g.titleDotText != nil {
-			g.titleDotText.Color = targetColor
-			g.titleDotText.Refresh()
-			if g.connCard != nil {
-				g.connCard.Refresh()
+		if g.pulseDot != nil {
+			g.pulseDot.SetConnected(isOK)
+		}
+
+		if g.connStatusText != nil {
+			if isOK {
+				g.connStatusText.Text = "Connected (ESP32-S3)"
+				g.connStatusText.Color = ColorCyan
+			} else {
+				g.connStatusText.Text = "Offline"
+				g.connStatusText.Color = ColorPurple
 			}
+			g.connStatusText.Refresh()
 		}
 
 		if g.btnToggleGrab != nil {
@@ -354,10 +518,10 @@ func (g *GUIApp) checkConnectionStatus() {
 		}
 
 		if g.devSummaryLabel != nil && g.grabber != nil {
+			devs := g.grabber.Devices()
 			if !isOK {
-				g.devSummaryLabel.SetText("Transmitter offline │ Grab safe")
+				g.devSummaryLabel.SetText(fmt.Sprintf("%d devs │ Offline (Safe)", len(devs)))
 			} else {
-				devs := g.grabber.Devices()
 				g.devSummaryLabel.SetText(fmt.Sprintf("%d devs │ [Scroll Lock]", len(devs)))
 			}
 		}

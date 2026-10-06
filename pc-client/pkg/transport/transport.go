@@ -53,6 +53,18 @@ type SerialTransport struct {
 	connected bool
 }
 
+// drainSerialPort reads and discards pending bytes in the serial RX buffer until idle
+func drainSerialPort(p serial.Port, timeout time.Duration) {
+	_ = p.SetReadTimeout(timeout)
+	buf := make([]byte, 256)
+	for {
+		n, err := p.Read(buf)
+		if err != nil || n == 0 {
+			break
+		}
+	}
+}
+
 // VerifyTransmitterHandshake opens a serial port, sends KVM_PKT_PING_REQ, and checks for "KVM_TRANSMITTER" response
 func VerifyTransmitterHandshake(portName string, baudRate int) (bool, string, error) {
 	mode := &serial.Mode{
@@ -68,6 +80,9 @@ func VerifyTransmitterHandshake(portName string, baudRate int) (bool, string, er
 	}
 	defer p.Close()
 
+	// Drain any boot logs or residual noise before pinging
+	drainSerialPort(p, 20*time.Millisecond)
+
 	_ = p.SetReadTimeout(30 * time.Millisecond)
 
 	req := protocol.EncodePingReq(1)
@@ -75,28 +90,26 @@ func VerifyTransmitterHandshake(portName string, baudRate int) (bool, string, er
 		return false, "", err
 	}
 
-	buf := make([]byte, 64)
+	buf := make([]byte, 512)
 	readBytes := 0
-	deadline := time.Now().Add(60 * time.Millisecond)
+	deadline := time.Now().Add(300 * time.Millisecond)
 
-	for readBytes < 27 && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && readBytes < len(buf)-27 {
 		n, err := p.Read(buf[readBytes:])
 		if err != nil {
 			break
 		}
-		readBytes += n
-	}
-
-	if readBytes < 27 {
-		return false, "", fmt.Errorf("no response from %s", portName)
-	}
-
-	for i := 0; i <= readBytes-27; i++ {
-		magic := binary.LittleEndian.Uint16(buf[i : i+2])
-		if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
-			parsed, err := protocol.ParsePingResp(buf[i : i+27])
-			if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
-				return true, parsed.DeviceID, nil
+		if n > 0 {
+			readBytes += n
+			for i := 0; i <= readBytes-27; i++ {
+				magic := binary.LittleEndian.Uint16(buf[i : i+2])
+				if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
+					parsed, err := protocol.ParsePingResp(buf[i : i+27])
+					if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
+						drainSerialPort(p, 10*time.Millisecond)
+						return true, parsed.DeviceID, nil
+					}
+				}
 			}
 		}
 	}
@@ -115,28 +128,50 @@ func AutoDetectSerialPort() (string, error) {
 		return "", fmt.Errorf("no serial devices found. Plug in the ESP32-S3 transmitter via USB")
 	}
 
-	// 1. Scan for a verified Cardputer-KVM transmitter dongle with response
+	// 1. Sort candidate USB-to-serial ports first (ttyUSB*, ttyACM*, usbserial*, COM*)
+	var usbPorts []string
+	var otherPorts []string
 	for _, p := range ports {
+		pLower := strings.ToLower(p)
+		if strings.Contains(pLower, "ttyusb") || strings.Contains(pLower, "ttyacm") ||
+			strings.Contains(pLower, "usbserial") || strings.Contains(pLower, "com") {
+			usbPorts = append(usbPorts, p)
+		} else {
+			otherPorts = append(otherPorts, p)
+		}
+	}
+
+	candidatePorts := append(usbPorts, otherPorts...)
+
+	// 2. Scan candidate ports for verified Cardputer-KVM transmitter handshake
+	for _, p := range candidatePorts {
+		// Skip motherboard legacy platform UARTs like /dev/ttyS0../dev/ttyS31
+		if strings.Contains(p, "/dev/ttyS") && !strings.Contains(p, "/dev/ttyUSB") {
+			continue
+		}
 		if verified, _, _ := VerifyTransmitterHandshake(p, 921600); verified {
 			return p, nil
 		}
 	}
 
-	// 2. Fallback: Prefer /dev/ttyUSB* (CH340 / CP2102)
+	// 3. Fallback: Prefer /dev/ttyUSB* (CH340 / CP2102)
 	for _, p := range ports {
 		if strings.Contains(p, "ttyUSB") {
 			return p, nil
 		}
 	}
 
-	// 3. Fallback: Prefer /dev/ttyACM* (Native ESP32-S3 USB CDC)
+	// 4. Fallback: Prefer /dev/ttyACM* (Native ESP32-S3 USB CDC)
 	for _, p := range ports {
 		if strings.Contains(p, "ttyACM") {
 			return p, nil
 		}
 	}
 
-	// 4. Fallback to first port
+	// 5. Fallback to first USB port or first port
+	if len(usbPorts) > 0 {
+		return usbPorts[0], nil
+	}
 	return ports[0], nil
 }
 
@@ -365,6 +400,9 @@ func (s *SerialTransport) VerifyHandshake() (bool, string) {
 		return false, ""
 	}
 
+	// Drain any leftover telemetry / logs before pinging
+	drainSerialPort(s.port, 15*time.Millisecond)
+
 	_ = s.port.SetReadTimeout(30 * time.Millisecond)
 
 	s.seq++
@@ -374,35 +412,32 @@ func (s *SerialTransport) VerifyHandshake() (bool, string) {
 		return false, ""
 	}
 
-	buf := make([]byte, 64)
+	buf := make([]byte, 512)
 	readBytes := 0
-	deadline := time.Now().Add(60 * time.Millisecond)
+	deadline := time.Now().Add(300 * time.Millisecond)
 
-	for readBytes < 27 && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && readBytes < len(buf)-27 {
 		n, err := s.port.Read(buf[readBytes:])
 		if err != nil {
+			// Real I/O error
 			s.connected = false
 			return false, ""
 		}
-		readBytes += n
-	}
-
-	if readBytes < 27 {
-		s.connected = false
-		return false, ""
-	}
-
-	for i := 0; i <= readBytes-27; i++ {
-		magic := binary.LittleEndian.Uint16(buf[i : i+2])
-		if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
-			parsed, err := protocol.ParsePingResp(buf[i : i+27])
-			if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
-				return true, parsed.DeviceID
+		if n > 0 {
+			readBytes += n
+			for i := 0; i <= readBytes-27; i++ {
+				magic := binary.LittleEndian.Uint16(buf[i : i+2])
+				if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
+					parsed, err := protocol.ParsePingResp(buf[i : i+27])
+					if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
+						drainSerialPort(s.port, 10*time.Millisecond)
+						return true, parsed.DeviceID
+					}
+				}
 			}
 		}
 	}
 
-	s.connected = false
 	return false, ""
 }
 

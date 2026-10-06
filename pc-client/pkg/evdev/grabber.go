@@ -241,8 +241,15 @@ func NewGrabber(trans transport.Transport, onEvent func(GrabEvent)) (*Grabber, e
 // SetTransport dynamically updates the active transport instance
 func (g *Grabber) SetTransport(trans transport.Transport) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.trans = trans
+	wasGrabbed := g.grabbed
+	g.mu.Unlock()
+
+	// If transport is lost or disconnected while input was grabbed,
+	// release the grab immediately so the user isn't locked out of their local desktop!
+	if wasGrabbed && (trans == nil || !trans.IsConnected()) {
+		_ = g.SetGrab(false)
+	}
 }
 
 func (g *Grabber) getTransport() transport.Transport {
@@ -260,20 +267,56 @@ func (g *Grabber) Start() {
 
 // ToggleGrab switches between Remote Hardware Grab and Local Pass-Through
 func (g *Grabber) ToggleGrab() bool {
-	g.mu.Lock()
-	newGrab := !g.grabbed
-	g.mu.Unlock()
+	g.mu.RLock()
+	current := g.grabbed
+	t := g.trans
+	g.mu.RUnlock()
 
-	_ = g.SetGrab(newGrab)
+	// If attempting to grab, verify that the transmitter transport is connected!
+	if !current {
+		if t == nil || !t.IsConnected() {
+			if g.onEvent != nil {
+				g.onEvent(GrabEvent{
+					Type:    EvtError,
+					Grabbed: false,
+					Message: "Cannot engage KVM grab: Transmitter dongle is not connected",
+					Time:    time.Now(),
+				})
+			}
+			return false
+		}
+	}
+
+	newGrab := !current
+	if err := g.SetGrab(newGrab); err != nil {
+		return false
+	}
 	return newGrab
 }
 
 // SetGrab explicitly engages or releases the hardware grab
 func (g *Grabber) SetGrab(grab bool) error {
+	var eventToEmit *GrabEvent
+
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	if grab {
+		// SAFETY GUARD: Refuse to grab physical input if transmitter is not connected!
+		if g.trans == nil || !g.trans.IsConnected() {
+			g.mu.Unlock()
+			if g.onEvent != nil {
+				g.onEvent(GrabEvent{
+					Type:    EvtError,
+					Grabbed: false,
+					Message: "Cannot engage KVM grab: Transmitter dongle is not connected",
+					Time:    time.Now(),
+				})
+			}
+			return fmt.Errorf("cannot grab input: transmitter dongle is not connected")
+		}
+	}
 
 	if g.grabbed == grab {
+		g.mu.Unlock()
 		return nil
 	}
 
@@ -299,31 +342,32 @@ func (g *Grabber) SetGrab(grab bool) error {
 	if !grab {
 		// When releasing grab back to local host:
 		// Send release packets to remote host so no keys remain stuck
-		if t := g.getTransport(); t != nil {
-			_ = t.SendRelease()
-			_ = t.SendMouse(0, 0, 0, 0)
+		if g.trans != nil && g.trans.IsConnected() {
+			_ = g.trans.SendRelease()
+			_ = g.trans.SendMouse(0, 0, 0, 0)
 		}
 		g.activeModifiers = 0
 		g.activeKeys = nil
 		g.activeMouseButtons = 0
 
-		if g.onEvent != nil {
-			g.onEvent(GrabEvent{
-				Type:    EvtGrabToggled,
-				Grabbed: false,
-				Message: "KVM RELEASED: Keyboard & Mouse returned to Local Linux Desktop",
-				Time:    time.Now(),
-			})
+		eventToEmit = &GrabEvent{
+			Type:    EvtGrabToggled,
+			Grabbed: false,
+			Message: "KVM RELEASED: Keyboard & Mouse returned to Local Linux Desktop",
+			Time:    time.Now(),
 		}
 	} else {
-		if g.onEvent != nil {
-			g.onEvent(GrabEvent{
-				Type:    EvtGrabToggled,
-				Grabbed: true,
-				Message: "KVM ENGAGED: Physical Input Exclusively Locked to Cardputer Target Host",
-				Time:    time.Now(),
-			})
+		eventToEmit = &GrabEvent{
+			Type:    EvtGrabToggled,
+			Grabbed: true,
+			Message: "KVM ENGAGED: Physical Input Exclusively Locked to Cardputer Target Host",
+			Time:    time.Now(),
 		}
+	}
+	g.mu.Unlock()
+
+	if eventToEmit != nil && g.onEvent != nil {
+		g.onEvent(*eventToEmit)
 	}
 
 	return nil
@@ -457,8 +501,8 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnLeft
 		}
-		if t := g.getTransport(); t != nil {
-			_ = t.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if g.trans != nil {
+			_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
 		}
 		g.emitMouseEvent(0, 0, 0)
 		return
@@ -469,8 +513,8 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnRight
 		}
-		if t := g.getTransport(); t != nil {
-			_ = t.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if g.trans != nil {
+			_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
 		}
 		g.emitMouseEvent(0, 0, 0)
 		return
@@ -481,8 +525,8 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnMiddle
 		}
-		if t := g.getTransport(); t != nil {
-			_ = t.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if g.trans != nil {
+			_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
 		}
 		g.emitMouseEvent(0, 0, 0)
 		return
@@ -543,8 +587,8 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 func (g *Grabber) sendReportLocked() {
 	var keys [6]byte
 	copy(keys[:], g.activeKeys)
-	if t := g.getTransport(); t != nil {
-		_ = t.SendReport(g.activeModifiers, keys)
+	if g.trans != nil {
+		_ = g.trans.SendReport(g.activeModifiers, keys)
 	}
 }
 

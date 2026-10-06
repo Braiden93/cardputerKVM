@@ -27,14 +27,21 @@ func main() {
 
 	flag.Parse()
 
+	isCLI := *pasteClipboard || *injectText != "" || *injectMacro != ""
+
 	// Connect to ESP32-S3 transmitter dongle via USB cable
 	trans, err := transport.NewSerialTransport(*serialPort, *baudRate)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting to ESP32-S3 transmitter dongle: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Tip: Ensure your ESP32-S3 is plugged into USB. Use -serial <device>\n")
-		os.Exit(1)
+		if isCLI {
+			fmt.Fprintf(os.Stderr, "Error connecting to ESP32-S3 transmitter dongle: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Tip: Ensure your ESP32-S3 is plugged into USB. Use -serial <device>\n")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Notice: Transmitter dongle not connected (%v). GUI starting in auto-detect mode...\n", err)
 	}
-	defer trans.Close()
+	if trans != nil {
+		defer trans.Close()
+	}
 
 	// 0. One-shot clipboard paste CLI mode
 	if *pasteClipboard {
@@ -103,7 +110,11 @@ func main() {
 	grabber.Start()
 
 	if *startGrabbed {
-		_ = grabber.SetGrab(true)
+		if trans != nil && trans.IsConnected() {
+			_ = grabber.SetGrab(true)
+		} else {
+			fmt.Fprintln(os.Stderr, "Warning: -grab ignored because transmitter dongle is not connected")
+		}
 	}
 
 	// Trap OS termination signals to ensure input is always ungrabbed on exit

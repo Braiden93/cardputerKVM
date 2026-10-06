@@ -37,9 +37,11 @@ type GUIApp struct {
 	titleDotText    *canvas.Text
 	portEntry       *widget.Entry
 	devSummaryLabel *widget.Label
+	btnToggleGrab   *widget.Button
 
-	isUpdatingUI bool
-	mu           sync.Mutex
+	missedHandshakes int
+	isUpdatingUI     bool
+	mu               sync.Mutex
 }
 
 func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
@@ -47,7 +49,7 @@ func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
 	a.Settings().SetTheme(theme.DarkTheme())
 
 	w := a.NewWindow("Cardputer-KVM ○ PASS-THROUGH")
-	w.Resize(fyne.NewSize(480, 160))
+	w.Resize(fyne.NewSize(520, 160))
 
 	g := &GUIApp{
 		fyneApp: a,
@@ -87,9 +89,11 @@ func (g *GUIApp) buildUI() {
 
 	// Card Header with Cyan (Connected & Verified) vs Purple (Disconnected / Unverified) Dot
 	dotColor := ColorPurple
+	isInitOK := false
 	if g.trans != nil && g.trans.IsConnected() {
 		if verified, _ := g.trans.VerifyHandshake(); verified {
 			dotColor = ColorCyan
+			isInitOK = true
 		}
 	}
 
@@ -120,6 +124,15 @@ func (g *GUIApp) buildUI() {
 	g.devSummaryLabel = widget.NewLabel(devCountStr)
 	g.devSummaryLabel.Importance = widget.LowImportance
 
+	g.btnToggleGrab = widget.NewButtonWithIcon("Engage KVM", theme.MediaPlayIcon(), func() {
+		if g.grabber != nil {
+			g.grabber.ToggleGrab()
+		}
+	})
+	if !isInitOK {
+		g.btnToggleGrab.Disable()
+	}
+
 	btnReconnect := widget.NewButtonWithIcon("Reconnect", theme.ViewRefreshIcon(), func() {
 		g.reconnectSerial()
 	})
@@ -127,6 +140,7 @@ func (g *GUIApp) buildUI() {
 	bottomBar := container.NewHBox(
 		g.devSummaryLabel,
 		layout.NewSpacer(),
+		g.btnToggleGrab,
 		btnReconnect,
 	)
 
@@ -163,15 +177,34 @@ func (g *GUIApp) updateStateUI(isGrabbed bool) {
 
 	if isGrabbed {
 		g.win.SetTitle("Cardputer-KVM ● TARGET ENGAGED")
+		if g.btnToggleGrab != nil {
+			g.btnToggleGrab.SetText("Release KVM")
+			g.btnToggleGrab.SetIcon(theme.MediaStopIcon())
+			g.btnToggleGrab.Importance = widget.HighImportance
+			g.btnToggleGrab.Refresh()
+		}
 	} else {
 		g.win.SetTitle("Cardputer-KVM ○ PASS-THROUGH")
+		if g.btnToggleGrab != nil {
+			g.btnToggleGrab.SetText("Engage KVM")
+			g.btnToggleGrab.SetIcon(theme.MediaPlayIcon())
+			g.btnToggleGrab.Importance = widget.MediumImportance
+			g.btnToggleGrab.Refresh()
+		}
 	}
 }
 
 func (g *GUIApp) HandleGrabEvent(evt evdev.GrabEvent) {
-	if evt.Type == evdev.EvtGrabToggled {
+	switch evt.Type {
+	case evdev.EvtGrabToggled:
 		fyne.Do(func() {
 			g.updateStateUI(evt.Grabbed)
+		})
+	case evdev.EvtError:
+		fyne.Do(func() {
+			if g.devSummaryLabel != nil {
+				g.devSummaryLabel.SetText(evt.Message)
+			}
 		})
 	}
 }
@@ -199,18 +232,28 @@ func (g *GUIApp) reconnectSerial() {
 		if g.connCard != nil {
 			g.connCard.Refresh()
 		}
+		if g.btnToggleGrab != nil {
+			g.btnToggleGrab.Disable()
+		}
 		return
 	}
 
 	g.trans = t
+	g.missedHandshakes = 0
 	if g.grabber != nil {
 		g.grabber.SetTransport(t)
 	}
 
 	if verified, _ := t.VerifyHandshake(); verified {
 		g.titleDotText.Color = ColorCyan
+		if g.btnToggleGrab != nil {
+			g.btnToggleGrab.Enable()
+		}
 	} else {
 		g.titleDotText.Color = ColorPurple
+		if g.btnToggleGrab != nil {
+			g.btnToggleGrab.Disable()
+		}
 	}
 	g.titleDotText.Refresh()
 	if g.connCard != nil {
@@ -237,25 +280,38 @@ func (g *GUIApp) checkConnectionStatus() {
 	isOK := false
 	if trans != nil && trans.IsConnected() {
 		verified, _ := trans.VerifyHandshake()
-		isOK = verified
-		if !verified {
-			_ = trans.Close()
+		if verified {
 			g.mu.Lock()
-			g.trans = nil
-			if g.grabber != nil {
-				g.grabber.SetTransport(nil)
+			g.missedHandshakes = 0
+			g.mu.Unlock()
+			isOK = true
+		} else {
+			g.mu.Lock()
+			g.missedHandshakes++
+			if g.missedHandshakes < 3 {
+				// Retain connection state during momentary latency spikes
+				isOK = true
+			} else {
+				// Device truly disconnected or unplugged
+				_ = trans.Close()
+				g.trans = nil
+				if g.grabber != nil {
+					g.grabber.SetTransport(nil)
+				}
+				isOK = false
 			}
 			g.mu.Unlock()
 		}
 	}
 
-	// If currently disconnected, try auto-detecting a re-plugged dongle
+	// If currently disconnected, auto-detect a connected or re-plugged dongle
 	if !isOK {
 		if detectedPort, err := transport.AutoDetectSerialPort(); err == nil && detectedPort != "" {
-			if verified, _, _ := transport.VerifyTransmitterHandshake(detectedPort, 921600); verified {
-				if t, err := transport.NewSerialTransport(detectedPort, 921600); err == nil {
+			if t, err := transport.NewSerialTransport(detectedPort, 921600); err == nil {
+				if verified, _ := t.VerifyHandshake(); verified {
 					g.mu.Lock()
 					g.trans = t
+					g.missedHandshakes = 0
 					if g.grabber != nil {
 						g.grabber.SetTransport(t)
 					}
@@ -265,6 +321,8 @@ func (g *GUIApp) checkConnectionStatus() {
 					fyne.Do(func() {
 						g.portEntry.SetText(detectedPort)
 					})
+				} else {
+					_ = t.Close()
 				}
 			}
 		}
@@ -284,6 +342,23 @@ func (g *GUIApp) checkConnectionStatus() {
 			g.titleDotText.Refresh()
 			if g.connCard != nil {
 				g.connCard.Refresh()
+			}
+		}
+
+		if g.btnToggleGrab != nil {
+			if isOK {
+				g.btnToggleGrab.Enable()
+			} else {
+				g.btnToggleGrab.Disable()
+			}
+		}
+
+		if g.devSummaryLabel != nil && g.grabber != nil {
+			if !isOK {
+				g.devSummaryLabel.SetText("Transmitter offline │ Grab safe")
+			} else {
+				devs := g.grabber.Devices()
+				g.devSummaryLabel.SetText(fmt.Sprintf("%d devs │ [Scroll Lock]", len(devs)))
 			}
 		}
 	})

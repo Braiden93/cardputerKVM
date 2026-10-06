@@ -16,6 +16,7 @@ type PulseDot struct {
 	innerCircle *canvas.Circle
 	outerCircle *canvas.Circle
 	active      bool
+	isDark      bool
 	scale       float32
 	anim        *fyne.Animation
 }
@@ -46,19 +47,35 @@ func heartbeatCurve(t float32) (scale float32, alpha float32) {
 	return
 }
 
-// NewPulseDot creates a new PulseDot widget with an initial connected state.
-func NewPulseDot(initConnected bool) *PulseDot {
-	dotColor := ColorPurple
-	if initConnected {
-		dotColor = ColorCyan
+func (p *PulseDot) primaryColor() color.NRGBA {
+	if p.isDark {
+		return ColorCyan
+	}
+	return color.NRGBA{R: 0x00, G: 0x89, B: 0x7B, A: 0xFF} // High contrast teal for light mode
+}
+
+func (p *PulseDot) offlineColor() color.NRGBA {
+	if p.isDark {
+		return ColorPurple
+	}
+	return color.NRGBA{R: 0x7C, G: 0x3A, B: 0xED, A: 0xFF}
+}
+
+// NewPulseDot creates a new PulseDot widget with an initial connected state and theme.
+func NewPulseDot(initConnected bool, isDark bool) *PulseDot {
+	p := &PulseDot{
+		active: initConnected,
+		isDark: isDark,
+		scale:  0.0,
 	}
 
-	p := &PulseDot{
-		innerCircle: canvas.NewCircle(dotColor),
-		outerCircle: canvas.NewCircle(color.Transparent),
-		active:      initConnected,
-		scale:       0.0,
+	dotColor := p.offlineColor()
+	if initConnected {
+		dotColor = p.primaryColor()
 	}
+
+	p.innerCircle = canvas.NewCircle(dotColor)
+	p.outerCircle = canvas.NewCircle(color.Transparent)
 	p.outerCircle.StrokeColor = color.Transparent
 	p.outerCircle.StrokeWidth = 1.5
 	p.ExtendBaseWidget(p)
@@ -67,7 +84,8 @@ func NewPulseDot(initConnected bool) *PulseDot {
 		s, a := heartbeatCurve(progress)
 		p.scale = s
 		alpha := uint8(a * 235)
-		p.outerCircle.StrokeColor = color.NRGBA{R: ColorCyan.R, G: ColorCyan.G, B: ColorCyan.B, A: alpha}
+		c := p.primaryColor()
+		p.outerCircle.StrokeColor = color.NRGBA{R: c.R, G: c.G, B: c.B, A: alpha}
 		p.Refresh()
 	})
 
@@ -89,13 +107,24 @@ func (p *PulseDot) SetConnected(connected bool) {
 	}
 	p.active = connected
 	if connected {
-		p.innerCircle.FillColor = ColorCyan
+		p.innerCircle.FillColor = p.primaryColor()
 	} else {
-		p.innerCircle.FillColor = ColorPurple
+		p.innerCircle.FillColor = p.offlineColor()
 		if p.anim != nil {
 			p.anim.Stop()
 		}
 		p.outerCircle.StrokeColor = color.Transparent
+	}
+	p.Refresh()
+}
+
+// SetTheme adapts dot and ring colors to Dark or Light mode.
+func (p *PulseDot) SetTheme(isDark bool) {
+	p.isDark = isDark
+	if p.active {
+		p.innerCircle.FillColor = p.primaryColor()
+	} else {
+		p.innerCircle.FillColor = p.offlineColor()
 	}
 	p.Refresh()
 }

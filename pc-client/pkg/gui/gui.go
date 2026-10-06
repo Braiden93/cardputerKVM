@@ -20,12 +20,9 @@ import (
 )
 
 var (
-	ColorCyan   = color.NRGBA{R: 0x00, G: 0xF5, B: 0xD4, A: 0xFF} // Neon Cyan (Connected / Engaged)
-	ColorPurple = color.NRGBA{R: 0x9D, G: 0x4E, B: 0xDD, A: 0xFF} // Purple (Disconnected)
-	ColorGreen  = color.NRGBA{R: 0x2E, G: 0xCC, B: 0x71, A: 0xFF} // Green (Good / Linked)
-	ColorPink   = color.NRGBA{R: 0xFF, G: 0x2A, B: 0x6D, A: 0xFF} // Neon Pink
-	ColorSoft   = color.NRGBA{R: 0xC7, G: 0x7D, B: 0xFF, A: 0xFF} // Soft Pink / Purple
-	ColorDim    = color.NRGBA{R: 0x6C, G: 0x75, B: 0x7D, A: 0xFF} // Muted Grey
+	ColorCyan   = color.NRGBA{R: 0x00, G: 0xF5, B: 0xD4, A: 0xFF} // Neon Cyan (Dark Mode)
+	ColorPurple = color.NRGBA{R: 0x9D, G: 0x4E, B: 0xDD, A: 0xFF} // Purple (Dark Mode)
+	ColorGreen  = color.NRGBA{R: 0x2E, G: 0xCC, B: 0x71, A: 0xFF} // Green
 	ColorWhite  = color.NRGBA{R: 0xF0, G: 0xF6, B: 0xF8, A: 0xFF}
 )
 
@@ -52,20 +49,22 @@ type GUIApp struct {
 	// Header
 	pulseDot       *PulseDot
 	connStatusText *canvas.Text
+	btnThemeToggle *widget.Button
+	isDarkMode     bool
 
 	// Connection Controls
 	portEntry *widget.Entry
 
-	// Compact Telemetry & Status
-	batteryLabel *widget.Label
-	signalLabel  *widget.Label
-	latencyLabel *widget.Label
-	txStatsLabel *widget.Label
-	rxStatsLabel *widget.Label
+	// Compact Telemetry & Status with Cardputer Battery Donut
+	batteryDonut    *BatteryDonut
+	batterySubLabel *widget.Label
+	signalLabel     *widget.Label
+	latencyLabel    *widget.Label
+	txStatsLabel    *widget.Label
+	rxStatsLabel    *widget.Label
 
-	// Bottom Action Bar
-	devSummaryLabel *widget.Label
-	btnToggleGrab   *widget.Button
+	// Slim Compact Footer
+	devSummaryText *canvas.Text
 
 	missedHandshakes int
 	heartBeatTick    int
@@ -75,16 +74,18 @@ type GUIApp struct {
 
 func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
 	a := app.NewWithID("com.cardputer.kvm")
-	a.Settings().SetTheme(theme.DarkTheme())
+	// Set default to Light Mode
+	a.Settings().SetTheme(theme.LightTheme())
 
 	w := a.NewWindow("Cardputer-KVM ○ PASS-THROUGH")
-	w.Resize(fyne.NewSize(450, 205))
+	w.Resize(fyne.NewSize(480, 140))
 
 	g := &GUIApp{
-		fyneApp: a,
-		win:     w,
-		trans:   trans,
-		grabber: grabber,
+		fyneApp:    a,
+		win:        w,
+		trans:      trans,
+		grabber:    grabber,
+		isDarkMode: false, // Default to light mode
 	}
 
 	g.buildUI()
@@ -92,11 +93,64 @@ func NewGUIApp(trans transport.Transport, grabber *evdev.Grabber) *GUIApp {
 	return g
 }
 
+func (g *GUIApp) getStatusColor(online bool) color.NRGBA {
+	if online {
+		if g.isDarkMode {
+			return ColorCyan
+		}
+		return color.NRGBA{R: 0x00, G: 0x7A, B: 0x6E, A: 0xFF} // High contrast teal for light mode
+	}
+	if g.isDarkMode {
+		return ColorPurple
+	}
+	return color.NRGBA{R: 0x6D, G: 0x28, B: 0xD9, A: 0xFF} // Purple for light mode
+}
+
+func (g *GUIApp) toggleTheme() {
+	g.mu.Lock()
+	g.isDarkMode = !g.isDarkMode
+	isDark := g.isDarkMode
+	trans := g.trans
+	online := trans != nil && trans.IsConnected()
+	g.mu.Unlock()
+
+	fyne.Do(func() {
+		if isDark {
+			g.fyneApp.Settings().SetTheme(theme.DarkTheme())
+			if g.btnThemeToggle != nil {
+				g.btnThemeToggle.SetText("☀️")
+			}
+		} else {
+			g.fyneApp.Settings().SetTheme(theme.LightTheme())
+			if g.btnThemeToggle != nil {
+				g.btnThemeToggle.SetText("🌙")
+			}
+		}
+
+		if g.pulseDot != nil {
+			g.pulseDot.SetTheme(isDark)
+		}
+		if g.batteryDonut != nil {
+			g.batteryDonut.SetTheme(isDark)
+		}
+		if g.connStatusText != nil {
+			g.connStatusText.Color = g.getStatusColor(online)
+			g.connStatusText.Refresh()
+		}
+		if g.devSummaryText != nil {
+			if isDark {
+				g.devSummaryText.Color = color.NRGBA{R: 0x94, G: 0xA3, B: 0xB8, A: 0xFF}
+			} else {
+				g.devSummaryText.Color = color.NRGBA{R: 0x64, G: 0x74, B: 0x8B, A: 0xFF}
+			}
+			g.devSummaryText.Refresh()
+		}
+	})
+}
+
 func (g *GUIApp) buildUI() {
-	// --- Header: App Title + Beating Status Dot + Connection Status ---
-	appTitle := canvas.NewText("Cardputer-KVM", ColorWhite)
-	appTitle.TextSize = 14
-	appTitle.TextStyle = fyne.TextStyle{Bold: true}
+	// --- Header: App Title + Centered Status Dot & Text + Theme Toggle ---
+	appTitle := widget.NewLabelWithStyle("Cardputer-KVM", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
 	isInitOK := false
 	if g.trans != nil && g.trans.IsConnected() {
@@ -105,24 +159,36 @@ func (g *GUIApp) buildUI() {
 		}
 	}
 
-	g.pulseDot = NewPulseDot(isInitOK)
+	g.pulseDot = NewPulseDot(isInitOK, g.isDarkMode)
 
 	connStatusStr := "Offline"
-	connStatusColor := ColorPurple
 	if isInitOK {
 		connStatusStr = "Connected (ESP32-S3)"
-		connStatusColor = ColorCyan
 	}
 
-	g.connStatusText = canvas.NewText(connStatusStr, connStatusColor)
+	g.connStatusText = canvas.NewText(connStatusStr, g.getStatusColor(isInitOK))
 	g.connStatusText.TextSize = 12
 	g.connStatusText.TextStyle = fyne.TextStyle{Bold: true}
+
+	// Lock the vertical centers of pulseDot and connStatusText together
+	statusGroup := container.NewHBox(
+		container.NewCenter(g.pulseDot),
+		container.NewCenter(g.connStatusText),
+	)
+
+	themeBtnText := "🌙"
+	if g.isDarkMode {
+		themeBtnText = "☀️"
+	}
+	g.btnThemeToggle = widget.NewButton(themeBtnText, func() {
+		g.toggleTheme()
+	})
 
 	headerBox := container.NewHBox(
 		appTitle,
 		layout.NewSpacer(),
-		g.pulseDot,
-		g.connStatusText,
+		statusGroup,
+		g.btnThemeToggle,
 	)
 
 	// --- Section 1: Compact Inline Port Bar ---
@@ -158,64 +224,63 @@ func (g *GUIApp) buildUI() {
 		g.portEntry,
 	)
 
-	// --- Section 2: Compact Status & Telemetry Card ---
-	battStr := "🔋 --"
+	// --- Section 2: Compact Status & Telemetry Card with Cardputer Battery Donut ---
+	g.batteryDonut = NewBatteryDonut(36, "X", isInitOK, g.isDarkMode)
+
+	battTitle := widget.NewLabelWithStyle("Cardputer Battery", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	battSub := "Firmware pending"
+	if !isInitOK {
+		battSub = "Cardputer offline"
+	}
+	g.batterySubLabel = widget.NewLabel(battSub)
+
+	battBox := container.NewHBox(
+		container.NewCenter(g.batteryDonut),
+		container.NewVBox(battTitle, g.batterySubLabel),
+	)
+
 	sigStr := "📶 Offline"
 	if isInitOK {
-		battStr = "🔋 85%"
 		sigStr = "📶 98% (-46 dBm)"
 	}
-
-	g.batteryLabel = widget.NewLabel(battStr)
-	g.batteryLabel.TextStyle = fyne.TextStyle{Bold: true}
-
 	g.signalLabel = widget.NewLabel(sigStr)
 	g.signalLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	g.latencyLabel = widget.NewLabel("⚡ < 1 ms")
-	g.latencyLabel.Importance = widget.LowImportance
 
 	g.txStatsLabel = widget.NewLabel("▲ TX: 0 pkts (0 B)")
 	g.rxStatsLabel = widget.NewLabel("▼ RX: 0 pkts (0 B)")
 
-	statusCard := widget.NewCard("", "", container.NewVBox(
-		container.NewHBox(
-			g.batteryLabel,
-			widget.NewSeparator(),
-			g.signalLabel,
-			layout.NewSpacer(),
-			g.latencyLabel,
-		),
-		container.NewHBox(
-			g.txStatsLabel,
-			layout.NewSpacer(),
-			g.rxStatsLabel,
-		),
-	))
+	infoCol := container.NewVBox(
+		container.NewHBox(g.signalLabel, layout.NewSpacer(), g.latencyLabel),
+		container.NewHBox(g.txStatsLabel, layout.NewSpacer(), g.rxStatsLabel),
+	)
 
-	// --- Section 3: Bottom Action Bar ---
-	devCountStr := "[Scroll Lock] Toggle"
+	statusContent := container.NewBorder(
+		nil, nil,
+		container.NewHBox(battBox, widget.NewSeparator()),
+		nil,
+		container.NewPadded(infoCol),
+	)
+
+	statusCard := widget.NewCard("", "", statusContent)
+
+	// --- Section 3: Shrunk, Ultra-Slim Footer ---
+	devCountStr := "[Scroll Lock] to toggle KVM"
 	if g.grabber != nil {
 		devs := g.grabber.Devices()
-		devCountStr = fmt.Sprintf("%d devs │ [Scroll Lock]", len(devs))
+		devCountStr = fmt.Sprintf("%d devices linked │ [Scroll Lock] to engage", len(devs))
 	}
-	g.devSummaryLabel = widget.NewLabel(devCountStr)
-	g.devSummaryLabel.Importance = widget.LowImportance
-
-	g.btnToggleGrab = widget.NewButtonWithIcon("Engage KVM", theme.MediaPlayIcon(), func() {
-		if g.grabber != nil {
-			g.grabber.ToggleGrab()
-		}
-	})
-	g.btnToggleGrab.Importance = widget.HighImportance
-	if !isInitOK {
-		g.btnToggleGrab.Disable()
+	footerColor := color.NRGBA{R: 0x64, G: 0x74, B: 0x8B, A: 0xFF}
+	if g.isDarkMode {
+		footerColor = color.NRGBA{R: 0x94, G: 0xA3, B: 0xB8, A: 0xFF}
 	}
+	g.devSummaryText = canvas.NewText(devCountStr, footerColor)
+	g.devSummaryText.TextSize = 11
 
-	bottomBar := container.NewHBox(
-		g.devSummaryLabel,
-		layout.NewSpacer(),
-		g.btnToggleGrab,
+	footerBox := container.NewHBox(
+		g.devSummaryText,
 	)
 
 	// Main Layout
@@ -224,10 +289,12 @@ func (g *GUIApp) buildUI() {
 		widget.NewSeparator(),
 		portRow,
 		statusCard,
-		bottomBar,
+		footerBox,
 	)
 
 	g.win.SetContent(mainContent)
+	// Shrink-wrap the window tightly around the content so there is zero empty space
+	g.win.Resize(mainContent.MinSize())
 
 	if g.grabber != nil {
 		g.updateStateUI(g.grabber.IsGrabbed())
@@ -251,17 +318,16 @@ func (g *GUIApp) updateStateUI(isGrabbed bool) {
 
 	if isGrabbed {
 		g.win.SetTitle("Cardputer-KVM ● TARGET ENGAGED")
-		if g.btnToggleGrab != nil {
-			g.btnToggleGrab.SetText("Release KVM")
-			g.btnToggleGrab.SetIcon(theme.MediaStopIcon())
-			g.btnToggleGrab.Refresh()
+		if g.devSummaryText != nil {
+			g.devSummaryText.Text = "● KVM Engaged (Input routed to target) │ [Scroll Lock] to return"
+			g.devSummaryText.Refresh()
 		}
 	} else {
 		g.win.SetTitle("Cardputer-KVM ○ PASS-THROUGH")
-		if g.btnToggleGrab != nil {
-			g.btnToggleGrab.SetText("Engage KVM")
-			g.btnToggleGrab.SetIcon(theme.MediaPlayIcon())
-			g.btnToggleGrab.Refresh()
+		if g.devSummaryText != nil && g.grabber != nil {
+			devs := g.grabber.Devices()
+			g.devSummaryText.Text = fmt.Sprintf("%d devices linked │ [Scroll Lock] to engage", len(devs))
+			g.devSummaryText.Refresh()
 		}
 	}
 }
@@ -274,8 +340,9 @@ func (g *GUIApp) HandleGrabEvent(evt evdev.GrabEvent) {
 		})
 	case evdev.EvtError:
 		fyne.Do(func() {
-			if g.devSummaryLabel != nil {
-				g.devSummaryLabel.SetText(evt.Message)
+			if g.devSummaryText != nil {
+				g.devSummaryText.Text = evt.Message
+				g.devSummaryText.Refresh()
 			}
 		})
 	}
@@ -302,13 +369,16 @@ func (g *GUIApp) reconnectSerial() {
 		if g.pulseDot != nil {
 			g.pulseDot.SetConnected(false)
 		}
+		if g.batteryDonut != nil {
+			g.batteryDonut.SetOnline(false)
+		}
+		if g.batterySubLabel != nil {
+			g.batterySubLabel.SetText("Cardputer offline")
+		}
 		if g.connStatusText != nil {
 			g.connStatusText.Text = "Offline"
-			g.connStatusText.Color = ColorPurple
+			g.connStatusText.Color = g.getStatusColor(false)
 			g.connStatusText.Refresh()
-		}
-		if g.btnToggleGrab != nil {
-			g.btnToggleGrab.Disable()
 		}
 		return
 	}
@@ -324,25 +394,31 @@ func (g *GUIApp) reconnectSerial() {
 			g.pulseDot.SetConnected(true)
 			g.pulseDot.Pulse()
 		}
+		if g.batteryDonut != nil {
+			g.batteryDonut.SetOnline(true)
+		}
+		if g.batterySubLabel != nil {
+			g.batterySubLabel.SetText("Firmware pending")
+		}
 		if g.connStatusText != nil {
 			g.connStatusText.Text = "Connected (ESP32-S3)"
-			g.connStatusText.Color = ColorCyan
+			g.connStatusText.Color = g.getStatusColor(true)
 			g.connStatusText.Refresh()
-		}
-		if g.btnToggleGrab != nil {
-			g.btnToggleGrab.Enable()
 		}
 	} else {
 		if g.pulseDot != nil {
 			g.pulseDot.SetConnected(false)
 		}
+		if g.batteryDonut != nil {
+			g.batteryDonut.SetOnline(false)
+		}
+		if g.batterySubLabel != nil {
+			g.batterySubLabel.SetText("Cardputer offline")
+		}
 		if g.connStatusText != nil {
 			g.connStatusText.Text = "Offline"
-			g.connStatusText.Color = ColorPurple
+			g.connStatusText.Color = g.getStatusColor(false)
 			g.connStatusText.Refresh()
-		}
-		if g.btnToggleGrab != nil {
-			g.btnToggleGrab.Disable()
 		}
 	}
 }
@@ -374,11 +450,14 @@ func (g *GUIApp) sendHeartbeatAndPulse() {
 			if g.pulseDot != nil {
 				g.pulseDot.SetConnected(false)
 			}
+			if g.batteryDonut != nil {
+				g.batteryDonut.SetOnline(false)
+			}
+			if g.batterySubLabel != nil {
+				g.batterySubLabel.SetText("Cardputer offline")
+			}
 			if g.signalLabel != nil {
 				g.signalLabel.SetText("📶 Offline")
-			}
-			if g.batteryLabel != nil {
-				g.batteryLabel.SetText("🔋 --")
 			}
 		})
 		return
@@ -396,11 +475,15 @@ func (g *GUIApp) sendHeartbeatAndPulse() {
 			g.pulseDot.SetConnected(true)
 			g.pulseDot.Pulse()
 		}
+		if g.batteryDonut != nil {
+			g.batteryDonut.SetOnline(true)
+			g.batteryDonut.SetValue("X", 0.0)
+		}
+		if g.batterySubLabel != nil {
+			g.batterySubLabel.SetText("Firmware pending")
+		}
 		if g.signalLabel != nil {
 			g.signalLabel.SetText("📶 98% (-46 dBm)")
-		}
-		if g.batteryLabel != nil {
-			g.batteryLabel.SetText("🔋 85%")
 		}
 	})
 }
@@ -498,32 +581,38 @@ func (g *GUIApp) checkConnectionStatus() {
 			g.pulseDot.SetConnected(isOK)
 		}
 
+		if g.batteryDonut != nil {
+			g.batteryDonut.SetOnline(isOK)
+		}
+
+		if g.batterySubLabel != nil {
+			if isOK {
+				g.batterySubLabel.SetText("Firmware pending")
+			} else {
+				g.batterySubLabel.SetText("Cardputer offline")
+			}
+		}
+
 		if g.connStatusText != nil {
 			if isOK {
 				g.connStatusText.Text = "Connected (ESP32-S3)"
-				g.connStatusText.Color = ColorCyan
 			} else {
 				g.connStatusText.Text = "Offline"
-				g.connStatusText.Color = ColorPurple
 			}
+			g.connStatusText.Color = g.getStatusColor(isOK)
 			g.connStatusText.Refresh()
 		}
 
-		if g.btnToggleGrab != nil {
-			if isOK {
-				g.btnToggleGrab.Enable()
-			} else {
-				g.btnToggleGrab.Disable()
-			}
-		}
-
-		if g.devSummaryLabel != nil && g.grabber != nil {
+		if g.devSummaryText != nil && g.grabber != nil {
 			devs := g.grabber.Devices()
 			if !isOK {
-				g.devSummaryLabel.SetText(fmt.Sprintf("%d devs │ Offline (Safe)", len(devs)))
+				g.devSummaryText.Text = fmt.Sprintf("%d devices detected │ Offline (Safe)", len(devs))
+			} else if g.grabber.IsGrabbed() {
+				g.devSummaryText.Text = "● KVM Engaged (Input routed to target) │ [Scroll Lock] to return"
 			} else {
-				g.devSummaryLabel.SetText(fmt.Sprintf("%d devs │ [Scroll Lock]", len(devs)))
+				g.devSummaryText.Text = fmt.Sprintf("%d devices linked │ [Scroll Lock] to engage", len(devs))
 			}
+			g.devSummaryText.Refresh()
 		}
 	})
 }

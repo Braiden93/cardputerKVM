@@ -262,11 +262,10 @@ func (g *GUIApp) buildUI() {
 		container.NewHBox(g.txStatsLabel, layout.NewSpacer(), g.rxStatsLabel),
 	)
 
-	statusContent := container.NewBorder(
-		nil, nil,
-		container.NewHBox(battBox, widget.NewSeparator()),
-		nil,
-		container.NewPadded(infoCol),
+	statusContent := container.NewGridWithColumns(
+		2,
+		battBox,
+		container.NewBorder(nil, nil, widget.NewSeparator(), nil, container.NewPadded(infoCol)),
 	)
 
 	statusCard := widget.NewCard("", "", statusContent)
@@ -298,8 +297,13 @@ func (g *GUIApp) buildUI() {
 	)
 
 	g.win.SetContent(mainContent)
-	// Shrink-wrap the window tightly around the content so there is zero empty space
-	g.win.Resize(mainContent.MinSize())
+	// Shrink-wrap the window tightly around the content so there is zero empty space,
+	// but enforce a solid minimum width so long messages never cause layout shifts.
+	minSz := mainContent.MinSize()
+	if minSz.Width < 500 {
+		minSz.Width = 500
+	}
+	g.win.Resize(minSz)
 
 	if g.grabber != nil {
 		g.updateStateUI(g.grabber.IsGrabbed())
@@ -377,7 +381,7 @@ func (g *GUIApp) reconnectSerial() {
 		if g.batteryDonut != nil {
 			g.batteryDonut.SetOnline(false)
 		}
-		if g.batterySubLabel != nil {
+		if g.batterySubLabel != nil && g.batterySubLabel.Text != "Cardputer offline" {
 			g.batterySubLabel.SetText("Cardputer offline")
 		}
 		if g.connStatusText != nil {
@@ -411,7 +415,7 @@ func (g *GUIApp) reconnectSerial() {
 		if g.batteryDonut != nil {
 			g.batteryDonut.SetOnline(false)
 		}
-		if g.batterySubLabel != nil {
+		if g.batterySubLabel != nil && g.batterySubLabel.Text != "Cardputer offline" {
 			g.batterySubLabel.SetText("Cardputer offline")
 		}
 		if g.connStatusText != nil {
@@ -473,7 +477,10 @@ func (g *GUIApp) handleTelemetryUpdate(telem *protocol.TelemetryPacket, rtt time
 			usbStatus = "🟢 Target USB Active"
 		}
 		volts := float64(telem.BatteryMv) / 1000.0
-		g.batterySubLabel.SetText(fmt.Sprintf("%.2f V  │  %s", volts, usbStatus))
+		newSub := fmt.Sprintf("%.2f V  │  %s", volts, usbStatus)
+		if g.batterySubLabel.Text != newSub {
+			g.batterySubLabel.SetText(newSub)
+		}
 	}
 
 	// 4. Update RF Signal (dBm converted to percentage)
@@ -486,13 +493,19 @@ func (g *GUIApp) handleTelemetryUpdate(telem *protocol.TelemetryPacket, rtt time
 		} else {
 			rssiPct = int(2 * (int(telem.RSSI) + 100))
 		}
-		g.signalLabel.SetText(fmt.Sprintf("📶 %d%% (%d dBm)", rssiPct, telem.RSSI))
+		newSig := fmt.Sprintf("📶 %d%% (%d dBm)", rssiPct, telem.RSSI)
+		if g.signalLabel.Text != newSig {
+			g.signalLabel.SetText(newSig)
+		}
 	}
 
 	// 5. Update Latency
 	if g.latencyLabel != nil {
 		if rtt > 0 {
-			g.latencyLabel.SetText(fmt.Sprintf("⚡ %.1f ms", float64(rtt.Microseconds())/1000.0))
+			newLat := fmt.Sprintf("⚡ %.1f ms", float64(rtt.Microseconds())/1000.0)
+			if g.latencyLabel.Text != newLat {
+				g.latencyLabel.SetText(newLat)
+			}
 		}
 	}
 }
@@ -517,13 +530,13 @@ func (g *GUIApp) sendHeartbeatAndPulse() {
 				g.batteryDonut.SetOnline(false)
 				g.batteryDonut.SetValue("X", 0.0)
 			}
-			if g.batterySubLabel != nil {
+			if g.batterySubLabel != nil && g.batterySubLabel.Text != "Dongle disconnected" {
 				g.batterySubLabel.SetText("Dongle disconnected")
 			}
-			if g.signalLabel != nil {
+			if g.signalLabel != nil && g.signalLabel.Text != "📶 Offline" {
 				g.signalLabel.SetText("📶 Offline")
 			}
-			if g.latencyLabel != nil {
+			if g.latencyLabel != nil && g.latencyLabel.Text != "⚡ -- ms" {
 				g.latencyLabel.SetText("⚡ -- ms")
 			}
 		})
@@ -540,13 +553,13 @@ func (g *GUIApp) sendHeartbeatAndPulse() {
 				g.batteryDonut.SetOnline(false)
 				g.batteryDonut.SetValue("X", 0.0)
 			}
-			if g.batterySubLabel != nil {
+			if g.batterySubLabel != nil && g.batterySubLabel.Text != "Cardputer offline" {
 				g.batterySubLabel.SetText("Cardputer offline")
 			}
-			if g.signalLabel != nil {
+			if g.signalLabel != nil && g.signalLabel.Text != "📶 Offline" {
 				g.signalLabel.SetText("📶 Offline")
 			}
-			if g.latencyLabel != nil {
+			if g.latencyLabel != nil && g.latencyLabel.Text != "⚡ -- ms" {
 				g.latencyLabel.SetText("⚡ -- ms")
 			}
 		})
@@ -577,16 +590,24 @@ func (g *GUIApp) updateTelemetryUI() {
 		defer g.mu.Unlock()
 
 		if g.txStatsLabel != nil {
-			g.txStatsLabel.SetText(fmt.Sprintf("▲ TX: %s pkts (%s)", formatCount(stats.PacketsSent), formatBytes(stats.BytesSent)))
+			newTx := fmt.Sprintf("▲ TX: %s pkts (%s)", formatCount(stats.PacketsSent), formatBytes(stats.BytesSent))
+			if g.txStatsLabel.Text != newTx {
+				g.txStatsLabel.SetText(newTx)
+			}
 		}
 		if g.rxStatsLabel != nil {
-			g.rxStatsLabel.SetText(fmt.Sprintf("▼ RX: %s pkts (%s)", formatCount(stats.PacketsRecv), formatBytes(stats.BytesRecv)))
+			newRx := fmt.Sprintf("▼ RX: %s pkts (%s)", formatCount(stats.PacketsRecv), formatBytes(stats.BytesRecv))
+			if g.rxStatsLabel.Text != newRx {
+				g.rxStatsLabel.SetText(newRx)
+			}
 		}
 		if g.latencyLabel != nil {
-			if !isCardputerAlive || stats.Latency == 0 {
-				g.latencyLabel.SetText("⚡ -- ms")
-			} else {
-				g.latencyLabel.SetText(fmt.Sprintf("⚡ %.1f ms", float64(stats.Latency.Microseconds())/1000.0))
+			newLat := "⚡ -- ms"
+			if isCardputerAlive && stats.Latency > 0 {
+				newLat = fmt.Sprintf("⚡ %.1f ms", float64(stats.Latency.Microseconds())/1000.0)
+			}
+			if g.latencyLabel.Text != newLat {
+				g.latencyLabel.SetText(newLat)
 			}
 		}
 	})
@@ -632,38 +653,48 @@ func (g *GUIApp) checkConnectionStatus() {
 			g.pulseDot.SetConnected(isOK)
 		}
 
-		if g.batteryDonut != nil {
-			g.batteryDonut.SetOnline(isOK)
-		}
-
-		if g.batterySubLabel != nil {
-			if isOK {
-				g.batterySubLabel.SetText("Firmware pending")
-			} else {
-				g.batterySubLabel.SetText("Cardputer offline")
-			}
-		}
-
 		if g.connStatusText != nil {
+			statusStr := "Offline"
 			if isOK {
-				g.connStatusText.Text = "Connected (ESP32-S3)"
-			} else {
-				g.connStatusText.Text = "Offline"
+				statusStr = "Connected (ESP32-S3)"
 			}
-			g.connStatusText.Color = g.getStatusColor(isOK)
-			g.connStatusText.Refresh()
+			if g.connStatusText.Text != statusStr {
+				g.connStatusText.Text = statusStr
+				g.connStatusText.Color = g.getStatusColor(isOK)
+				g.connStatusText.Refresh()
+			}
+		}
+
+		if !isOK {
+			if g.batteryDonut != nil {
+				g.batteryDonut.SetOnline(false)
+				g.batteryDonut.SetValue("X", 0.0)
+			}
+			if g.batterySubLabel != nil && g.batterySubLabel.Text != "Dongle disconnected" {
+				g.batterySubLabel.SetText("Dongle disconnected")
+			}
+			if g.signalLabel != nil && g.signalLabel.Text != "📶 Offline" {
+				g.signalLabel.SetText("📶 Offline")
+			}
+			if g.latencyLabel != nil && g.latencyLabel.Text != "⚡ -- ms" {
+				g.latencyLabel.SetText("⚡ -- ms")
+			}
 		}
 
 		if g.devSummaryText != nil && g.grabber != nil {
 			devs := g.grabber.Devices()
+			newSummary := ""
 			if !isOK {
-				g.devSummaryText.Text = fmt.Sprintf("%d devices detected │ Offline (Safe)", len(devs))
+				newSummary = fmt.Sprintf("%d devices detected │ Offline (Safe)", len(devs))
 			} else if g.grabber.IsGrabbed() {
-				g.devSummaryText.Text = "● KVM Engaged (Input routed to target) │ [Scroll Lock] to return"
+				newSummary = "● KVM Engaged (Input routed to target) │ [Scroll Lock] to return"
 			} else {
-				g.devSummaryText.Text = fmt.Sprintf("%d devices linked │ [Scroll Lock] to engage", len(devs))
+				newSummary = fmt.Sprintf("%d devices linked │ [Scroll Lock] to engage", len(devs))
 			}
-			g.devSummaryText.Refresh()
+			if g.devSummaryText.Text != newSummary {
+				g.devSummaryText.Text = newSummary
+				g.devSummaryText.Refresh()
+			}
 		}
 	})
 }

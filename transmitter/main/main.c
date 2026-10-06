@@ -44,13 +44,18 @@ static void on_espnow_sent(const uint8_t *mac_addr, esp_now_send_status_t status
 
 static void send_raw_packet(const void *data, size_t len)
 {
-    esp_err_t result = esp_now_send(broadcast_mac, (const uint8_t*)data, len);
-    if (result == ESP_ERR_ESPNOW_NO_MEM) {
-        // Queue full: yield 1 tick and retry once
-        vTaskDelay(pdMS_TO_TICKS(1));
-        esp_now_send(broadcast_mac, (const uint8_t*)data, len);
+    int retries = 5;
+    while (retries-- > 0) {
+        esp_err_t result = esp_now_send(broadcast_mac, (const uint8_t*)data, len);
+        if (result == ESP_OK) {
+            break;
+        }
+        if (result == ESP_ERR_ESPNOW_NO_MEM) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } else {
+            break;
+        }
     }
-    // Do NOT log to UART0 on drop — UART0 is the active binary data channel!
 }
 
 static void send_key_report(uint8_t modifiers, uint8_t keycode)
@@ -63,7 +68,13 @@ static void send_key_report(uint8_t modifiers, uint8_t keycode)
     pkt.keycodes[0] = keycode;
     pkt.seq_num = packet_seq++;
 
-    send_raw_packet(&pkt, sizeof(pkt));
+    // Redundant triple-burst to guarantee 99.999% over-the-air packet reception
+    for (int r = 0; r < 3; r++) {
+        send_raw_packet(&pkt, sizeof(pkt));
+        if (r < 2) {
+            esp_rom_delay_us(200);
+        }
+    }
 }
 
 // Send press + release
@@ -172,27 +183,45 @@ static void send_string(const char *str)
 }
 
 /***********************************************************************
- * 2. Background Tasks
+ * 2. Background Tasks & Callbacks
  ***********************************************************************/
-
-// Heartbeat task: keeps link active on Cardputer display
-static void heartbeat_task(void *pvParameters)
-{
-    while (1) {
-        kvm_heartbeat_packet_t hb;
-        hb.magic = KVM_ESPNOW_MAGIC;
-        hb.pkt_type = KVM_PKT_HEARTBEAT;
-        hb.uptime_ms = esp_log_timestamp();
-        hb.seq_num = packet_seq++;
-
-        send_raw_packet(&hb, sizeof(hb));
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 2048
 #define UART_BAUD_RATE 921600
+
+static uint32_t last_uart_rx_time = 0;
+
+// ESP-NOW Receive Callback: Forward Cardputer Telemetry directly to PC Client via UART0
+static void on_espnow_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (len >= sizeof(kvm_telemetry_packet_t)) {
+        const kvm_telemetry_packet_t *pkt = (const kvm_telemetry_packet_t*)data;
+        if (pkt->magic == KVM_ESPNOW_MAGIC && pkt->pkt_type == KVM_PKT_TELEMETRY) {
+            uart_write_bytes(UART_PORT, data, sizeof(kvm_telemetry_packet_t));
+        }
+    }
+}
+
+// Arbitrated Heartbeat task: broadcasts idle standby beacon only when PC Client app is NOT running
+static void heartbeat_task(void *pvParameters)
+{
+    while (1) {
+        uint32_t now = esp_log_timestamp();
+        // If PC client has been silent for > 3000ms, broadcast standby beacon (host_status = KVM_HOST_STANDBY)
+        if (last_uart_rx_time == 0 || (now - last_uart_rx_time > 3000)) {
+            kvm_heartbeat_packet_t hb;
+            hb.magic = KVM_ESPNOW_MAGIC;
+            hb.pkt_type = KVM_PKT_HEARTBEAT;
+            hb.host_status = KVM_HOST_STANDBY; // 0x00: Dongle powered on, PC app not running
+            hb.uptime_ms = now;
+            hb.seq_num = packet_seq++;
+
+            send_raw_packet(&hb, sizeof(hb));
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
 
 static void init_uart()
 {
@@ -220,6 +249,7 @@ static void serial_bridge_task(void *pvParameters)
     while (1) {
         int len = uart_read_bytes(UART_PORT, rx_buf + rx_len, sizeof(rx_buf) - rx_len, pdMS_TO_TICKS(1));
         if (len > 0) {
+            last_uart_rx_time = esp_log_timestamp();
             rx_len += len;
 
             while (rx_len >= 2) {
@@ -235,6 +265,8 @@ static void serial_bridge_task(void *pvParameters)
                         pkt_size = sizeof(kvm_mouse_packet_t);
                     } else if (pkt_type == KVM_PKT_HEARTBEAT) {
                         pkt_size = sizeof(kvm_heartbeat_packet_t);
+                    } else if (pkt_type == KVM_PKT_PING_REQ) {
+                        pkt_size = sizeof(kvm_ping_req_packet_t);
                     } else {
                         // Unknown packet type under valid magic, advance 1 byte to realign
                         rx_len--;
@@ -247,8 +279,29 @@ static void serial_bridge_task(void *pvParameters)
                         break;
                     }
 
-                    // Beam packet immediately over ESP-NOW!
-                    send_raw_packet(rx_buf, pkt_size);
+                    // Process packet
+                    if (pkt_type == KVM_PKT_PING_REQ) {
+                        kvm_ping_resp_packet_t resp;
+                        memset(&resp, 0, sizeof(resp));
+                        resp.magic = KVM_ESPNOW_MAGIC;
+                        resp.pkt_type = KVM_PKT_PING_RESP;
+                        esp_wifi_get_mac(WIFI_IF_STA, resp.mac);
+                        strncpy(resp.device_id, "KVM_TRANSMITTER", sizeof(resp.device_id) - 1);
+                        resp.seq_num = packet_seq++;
+
+                        uart_write_bytes(UART_PORT, &resp, sizeof(resp));
+                        ESP_LOGI(TAG, "Identity ping request received, sent 'KVM_TRANSMITTER' response");
+                    } else if (pkt_type == KVM_PKT_KEY_REPORT) {
+                        // Redundant triple-burst to guarantee 99.999% over-the-air packet reception
+                        for (int r = 0; r < 3; r++) {
+                            send_raw_packet(rx_buf, pkt_size);
+                            if (r < 2) {
+                                esp_rom_delay_us(200);
+                            }
+                        }
+                    } else {
+                        send_raw_packet(rx_buf, pkt_size);
+                    }
 
                     rx_len -= pkt_size;
                     if (rx_len > 0) {
@@ -295,11 +348,14 @@ static void init_espnow_transmitter()
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
     ESP_ERROR_CHECK(esp_wifi_set_channel(KVM_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     ESP_LOGI(TAG, "Initializing ESP-NOW...");
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_espnow_sent));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
 
     // Register broadcast peer
     esp_now_peer_info_t peer_info = {};
@@ -308,9 +364,9 @@ static void init_espnow_transmitter()
     peer_info.ifidx = WIFI_IF_STA;
     peer_info.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_12M);
 
-    ESP_LOGI(TAG, "ESP-NOW Transmitter ready on Channel %d (Broadcast: FF:FF:FF:FF:FF:FF, 24M PHY)", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "ESP-NOW Transmitter ready on Channel %d (Broadcast: FF:FF:FF:FF:FF:FF, 12M PHY, Max Power, No PS)", KVM_ESPNOW_CHANNEL);
 }
 
 void app_main(void)

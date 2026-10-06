@@ -99,6 +99,11 @@ type Grabber struct {
 	lastMouseFlush     time.Time
 	lastUIMouseEvent   time.Time
 	mouseMu            sync.Mutex
+
+	// Fast Clipboard Paste State
+	isPasting   bool
+	cancelPaste chan struct{}
+	pasteMu     sync.Mutex
 }
 
 // DiscoverDevices scans /proc/bus/input/devices for physical keyboards and mice
@@ -233,6 +238,26 @@ func NewGrabber(trans transport.Transport, onEvent func(GrabEvent)) (*Grabber, e
 	return g, nil
 }
 
+// SetTransport dynamically updates the active transport instance
+func (g *Grabber) SetTransport(trans transport.Transport) {
+	g.mu.Lock()
+	g.trans = trans
+	wasGrabbed := g.grabbed
+	g.mu.Unlock()
+
+	// If transport is lost or disconnected while input was grabbed,
+	// release the grab immediately so the user isn't locked out of their local desktop!
+	if wasGrabbed && (trans == nil || !trans.IsConnected()) {
+		_ = g.SetGrab(false)
+	}
+}
+
+func (g *Grabber) getTransport() transport.Transport {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.trans
+}
+
 // Start begins event listening loops on all devices
 func (g *Grabber) Start() {
 	for _, dev := range g.devices {
@@ -242,20 +267,56 @@ func (g *Grabber) Start() {
 
 // ToggleGrab switches between Remote Hardware Grab and Local Pass-Through
 func (g *Grabber) ToggleGrab() bool {
-	g.mu.Lock()
-	newGrab := !g.grabbed
-	g.mu.Unlock()
+	g.mu.RLock()
+	current := g.grabbed
+	t := g.trans
+	g.mu.RUnlock()
 
-	_ = g.SetGrab(newGrab)
+	// If attempting to grab, verify that the transmitter transport is connected!
+	if !current {
+		if t == nil || !t.IsConnected() {
+			if g.onEvent != nil {
+				g.onEvent(GrabEvent{
+					Type:    EvtError,
+					Grabbed: false,
+					Message: "Cannot engage KVM grab: Transmitter dongle is not connected",
+					Time:    time.Now(),
+				})
+			}
+			return false
+		}
+	}
+
+	newGrab := !current
+	if err := g.SetGrab(newGrab); err != nil {
+		return false
+	}
 	return newGrab
 }
 
 // SetGrab explicitly engages or releases the hardware grab
 func (g *Grabber) SetGrab(grab bool) error {
+	var eventToEmit *GrabEvent
+
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	if grab {
+		// SAFETY GUARD: Refuse to grab physical input if transmitter is not connected!
+		if g.trans == nil || !g.trans.IsConnected() {
+			g.mu.Unlock()
+			if g.onEvent != nil {
+				g.onEvent(GrabEvent{
+					Type:    EvtError,
+					Grabbed: false,
+					Message: "Cannot engage KVM grab: Transmitter dongle is not connected",
+					Time:    time.Now(),
+				})
+			}
+			return fmt.Errorf("cannot grab input: transmitter dongle is not connected")
+		}
+	}
 
 	if g.grabbed == grab {
+		g.mu.Unlock()
 		return nil
 	}
 
@@ -281,29 +342,32 @@ func (g *Grabber) SetGrab(grab bool) error {
 	if !grab {
 		// When releasing grab back to local host:
 		// Send release packets to remote host so no keys remain stuck
-		_ = g.trans.SendRelease()
-		_ = g.trans.SendMouse(0, 0, 0, 0)
+		if g.trans != nil && g.trans.IsConnected() {
+			_ = g.trans.SendRelease()
+			_ = g.trans.SendMouse(0, 0, 0, 0)
+		}
 		g.activeModifiers = 0
 		g.activeKeys = nil
 		g.activeMouseButtons = 0
 
-		if g.onEvent != nil {
-			g.onEvent(GrabEvent{
-				Type:    EvtGrabToggled,
-				Grabbed: false,
-				Message: "KVM RELEASED: Keyboard & Mouse returned to Local Linux Desktop",
-				Time:    time.Now(),
-			})
+		eventToEmit = &GrabEvent{
+			Type:    EvtGrabToggled,
+			Grabbed: false,
+			Message: "KVM RELEASED: Keyboard & Mouse returned to Local Linux Desktop",
+			Time:    time.Now(),
 		}
 	} else {
-		if g.onEvent != nil {
-			g.onEvent(GrabEvent{
-				Type:    EvtGrabToggled,
-				Grabbed: true,
-				Message: "KVM ENGAGED: Physical Input Exclusively Locked to Cardputer Target Host",
-				Time:    time.Now(),
-			})
+		eventToEmit = &GrabEvent{
+			Type:    EvtGrabToggled,
+			Grabbed: true,
+			Message: "KVM ENGAGED: Physical Input Exclusively Locked to Cardputer Target Host",
+			Time:    time.Now(),
 		}
+	}
+	g.mu.Unlock()
+
+	if eventToEmit != nil && g.onEvent != nil {
+		g.onEvent(*eventToEmit)
 	}
 
 	return nil
@@ -390,8 +454,44 @@ func (g *Grabber) handleInputEvent(dev *Device, evt InputEvent) {
 
 // handleKeyEvent handles key presses, releases, and mouse button clicks
 func (g *Grabber) handleKeyEvent(evt InputEvent) {
+	// Cancel ongoing paste if user presses Esc
+	if evt.Code == EvKeyEsc && evt.Value == 1 {
+		if g.IsPasting() {
+			g.CancelPaste()
+			return
+		}
+	}
+
+	// While high-speed paste is active, drop user typing so it doesn't corrupt the injected stream
+	if g.IsPasting() {
+		return
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// Fast Clipboard Paste shortcuts:
+	// 1. Ctrl+Shift+V or Ctrl+Alt+V
+	if evt.Code == EvKeyV {
+		hasCtrl := (g.activeModifiers & (protocol.ModLeftCtrl | protocol.ModRightCtrl)) != 0
+		hasShift := (g.activeModifiers & (protocol.ModLeftShift | protocol.ModRightShift)) != 0
+		hasAlt := (g.activeModifiers & (protocol.ModLeftAlt | protocol.ModRightAlt)) != 0
+
+		if (hasCtrl && hasShift) || (hasCtrl && hasAlt) {
+			if evt.Value == 1 {
+				go g.PasteHostClipboard()
+			}
+			return
+		}
+	}
+
+	// 2. Dedicated single-key trigger: Pause/Break key
+	if evt.Code == EvKeyPause {
+		if evt.Value == 1 {
+			go g.PasteHostClipboard()
+		}
+		return
+	}
 
 	// A. Mouse Buttons
 	switch evt.Code {
@@ -401,7 +501,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnLeft
 		}
-		_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if g.trans != nil {
+			_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		}
 		g.emitMouseEvent(0, 0, 0)
 		return
 
@@ -411,7 +513,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnRight
 		}
-		_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if g.trans != nil {
+			_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		}
 		g.emitMouseEvent(0, 0, 0)
 		return
 
@@ -421,7 +525,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnMiddle
 		}
-		_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if g.trans != nil {
+			_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		}
 		g.emitMouseEvent(0, 0, 0)
 		return
 	}
@@ -481,7 +587,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 func (g *Grabber) sendReportLocked() {
 	var keys [6]byte
 	copy(keys[:], g.activeKeys)
-	_ = g.trans.SendReport(g.activeModifiers, keys)
+	if g.trans != nil {
+		_ = g.trans.SendReport(g.activeModifiers, keys)
+	}
 }
 
 // emitKeyEvent dispatches key telemetry to the UI callback
@@ -562,8 +670,11 @@ func (g *Grabber) handleSynEvent() {
 	g.mouseWheel = 0
 	g.mouseMu.Unlock()
 
+	t := g.getTransport()
 	for i := 0; i < count; i++ {
-		_ = g.trans.SendMouse(buttons, reports[i][0], reports[i][1], reports[i][2])
+		if t != nil {
+			_ = t.SendMouse(buttons, reports[i][0], reports[i][1], reports[i][2])
+		}
 		g.emitMouseEvent(reports[i][0], reports[i][1], reports[i][2])
 	}
 }
@@ -613,8 +724,10 @@ func (g *Grabber) Close() error {
 			_ = dev.file.Close()
 		}
 
-		_ = g.trans.SendRelease()
-		_ = g.trans.SendMouse(0, 0, 0, 0)
+		if t := g.getTransport(); t != nil {
+			_ = t.SendRelease()
+			_ = t.SendMouse(0, 0, 0, 0)
+		}
 	})
 	return nil
 }
@@ -628,3 +741,97 @@ func clampInt8(v int32) int8 {
 	}
 	return int8(v)
 }
+
+// PasteHostClipboard reads the host clipboard and injects it at ~125 chars/sec
+func (g *Grabber) PasteHostClipboard() {
+	g.pasteMu.Lock()
+	if g.isPasting {
+		g.pasteMu.Unlock()
+		return
+	}
+	g.isPasting = true
+	g.cancelPaste = make(chan struct{})
+	cancel := g.cancelPaste
+	g.pasteMu.Unlock()
+
+	defer func() {
+		g.pasteMu.Lock()
+		g.isPasting = false
+		g.cancelPaste = nil
+		g.pasteMu.Unlock()
+	}()
+
+	t := g.getTransport()
+	if t == nil {
+		g.emitLog("Paste failed: transport not connected")
+		return
+	}
+
+	text, err := ReadHostClipboard()
+	if err != nil {
+		g.emitLog(fmt.Sprintf("❌ Clipboard error: %v", err))
+		return
+	}
+
+	runes := []rune(text)
+	total := len(runes)
+	if total == 0 {
+		g.emitLog("Clipboard is empty.")
+		return
+	}
+
+	// 1. Clear any currently held physical modifiers (Ctrl, Shift, Alt) on the target host
+	g.mu.Lock()
+	g.activeKeys = nil
+	g.activeModifiers = 0
+	_ = t.SendRelease()
+	g.mu.Unlock()
+	time.Sleep(10 * time.Millisecond)
+
+	g.emitLog(fmt.Sprintf("⚡ High-speed pasting %d chars (~125 chars/sec)... [Esc to cancel]", total))
+
+	lastPct := -1
+	err = t.SendStringFast(text, cancel, func(done, total int) {
+		pct := (done * 100) / total
+		if pct/25 != lastPct/25 {
+			lastPct = pct
+			g.emitLog(fmt.Sprintf("⚡ Pasting: %d/%d chars (%d%%)...", done, total, pct))
+		}
+	})
+
+	if err != nil {
+		g.emitLog(fmt.Sprintf("❌ Paste interrupted: %v", err))
+	} else {
+		g.emitLog(fmt.Sprintf("✓ Successfully pasted %d characters!", total))
+	}
+}
+
+// CancelPaste interrupts an active high-speed text paste
+func (g *Grabber) CancelPaste() {
+	g.pasteMu.Lock()
+	defer g.pasteMu.Unlock()
+	if g.isPasting && g.cancelPaste != nil {
+		close(g.cancelPaste)
+		g.cancelPaste = nil
+	}
+}
+
+// IsPasting returns true if a high-speed paste is currently in flight
+func (g *Grabber) IsPasting() bool {
+	g.pasteMu.Lock()
+	defer g.pasteMu.Unlock()
+	return g.isPasting
+}
+
+// emitLog sends an event log to the UI stream
+func (g *Grabber) emitLog(msg string) {
+	if g.onEvent != nil {
+		g.onEvent(GrabEvent{
+			Type:    EvtLog,
+			Grabbed: g.IsGrabbed(),
+			Message: msg,
+			Time:    time.Now(),
+		})
+	}
+}
+

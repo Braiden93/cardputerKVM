@@ -42,6 +42,15 @@ static char remote_mac_str[18] = "None";
 static uint32_t last_remote_packet_time = 0;
 static bool remote_linked = false;
 
+// Remote Transmitter Address & Telemetry State
+static uint8_t s_transmitter_mac[6] = {0};
+static bool s_transmitter_peer_registered = false;
+static int8_t s_last_rssi = -60;
+static uint8_t s_last_host_status = KVM_HOST_STANDBY;
+static uint16_t s_pending_echo_seq = 0;
+static uint16_t s_telemetry_seq = 0;
+static TaskHandle_t s_telemetry_task_handle = NULL;
+
 // Live Input Activity & Visual Feedback Tracking
 static uint32_t last_kbd_event_time = 0;
 static uint8_t  last_kbd_mod = 0;
@@ -57,6 +66,7 @@ static int32_t  live_display_mouse_wheel = 0;
 static uint8_t  live_display_mouse_buttons = 0;
 static uint8_t  last_clicked_buttons = 0;
 static uint32_t total_mouse_packets = 0;
+static uint32_t total_rx_packets = 0;
 
 // Offscreen Canvas for Tear-Free 25FPS Rendering
 static M5Canvas s_canvas(&M5.Display);
@@ -192,7 +202,10 @@ static void kvm_dispatcher_task(void *pvParameters)
                     }
                 }
                 uint8_t *keys = has_key ? evt.keycodes : NULL;
-                tusb_hid_device_helper_report(evt.modifiers, keys);
+                int retries = 50;
+                while (!tusb_hid_device_helper_report(evt.modifiers, keys) && retries-- > 0) {
+                    esp_rom_delay_us(100);
+                }
 
                 if (has_key || evt.modifiers != 0) {
                     last_kbd_event_time = esp_log_timestamp();
@@ -267,11 +280,25 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
     uint32_t now = esp_log_timestamp();
     last_remote_packet_time = now;
     remote_linked = true;
+    total_rx_packets++;
 
     uint8_t pkt_type = data[2];
 
     if (pkt_type == KVM_PKT_KEY_REPORT && len >= sizeof(kvm_key_packet_t)) {
         const kvm_key_packet_t *pkt = (const kvm_key_packet_t*)data;
+
+        // Sequence deduplication for redundant RF burst frames
+        static uint16_t last_key_seq = 0xFFFF;
+        static uint32_t last_key_seq_time = 0;
+        static bool has_seen_key = false;
+
+        if (has_seen_key && pkt->seq_num == last_key_seq && (now - last_key_seq_time < 500)) {
+            return; // Ignore duplicate frame from redundant burst
+        }
+        last_key_seq = pkt->seq_num;
+        last_key_seq_time = now;
+        has_seen_key = true;
+
         kvm_event_t evt = {};
         evt.pkt_type = pkt_type;
         evt.modifiers = pkt->modifiers;
@@ -309,8 +336,42 @@ static void process_kvm_packet(const uint8_t *data, int len, const char *source_
         s_mouse_state.dirty = true;
         portEXIT_CRITICAL(&s_mouse_state.mux);
     }
-    else if (pkt_type == KVM_PKT_HEARTBEAT) {
-        ESP_LOGD(TAG, "[%s] Heartbeat received", source_tag);
+    else if (pkt_type == KVM_PKT_HEARTBEAT && len >= sizeof(kvm_heartbeat_packet_t)) {
+        const kvm_heartbeat_packet_t *hb = (const kvm_heartbeat_packet_t*)data;
+        s_last_host_status = hb->host_status;
+        s_pending_echo_seq = hb->seq_num;
+        ESP_LOGD(TAG, "[%s] Heartbeat received: host_status=%d, seq=%u", source_tag, hb->host_status, hb->seq_num);
+        if (s_telemetry_task_handle != NULL) {
+            xTaskNotifyGive(s_telemetry_task_handle);
+        }
+    }
+}
+
+// Telemetry Task: Safely reads battery & USB status in FreeRTOS task context and sends ACK over ESP-NOW
+static void telemetry_task(void *pvParameters)
+{
+    while (1) {
+        // Wait for heartbeat notification (or 2000ms periodic timeout fallback)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+
+        if (s_transmitter_peer_registered) {
+            kvm_telemetry_packet_t telem = {};
+            telem.magic = KVM_ESPNOW_MAGIC;
+            telem.pkt_type = KVM_PKT_TELEMETRY;
+
+            int batt = M5.Power.getBatteryLevel();
+            telem.battery_pct = (batt < 0) ? 0 : (batt > 100 ? 100 : (uint8_t)batt);
+
+            int16_t mv = M5.Power.getBatteryVoltage();
+            telem.battery_mv = (mv < 0) ? 0 : (uint16_t)mv;
+
+            telem.rssi = s_last_rssi;
+            telem.usb_mounted = tusb_hid_device_helper_is_mounted() ? 1 : 0;
+            telem.echo_seq = s_pending_echo_seq;
+            telem.seq_num = s_telemetry_seq++;
+
+            esp_now_send(s_transmitter_mac, (const uint8_t*)&telem, sizeof(telem));
+        }
     }
 }
 
@@ -321,6 +382,22 @@ static void on_espnow_recv(const esp_now_recv_info_t *recv_info, const uint8_t *
     snprintf(remote_mac_str, sizeof(remote_mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
              recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
              recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+
+    // Dynamically register transmitter peer for unicast telemetry responses
+    if (!esp_now_is_peer_exist(recv_info->src_addr)) {
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, recv_info->src_addr, 6);
+        peer.channel = KVM_ESPNOW_CHANNEL;
+        peer.ifidx = WIFI_IF_STA;
+        peer.encrypt = false;
+        esp_now_add_peer(&peer);
+    }
+    memcpy(s_transmitter_mac, recv_info->src_addr, 6);
+    s_transmitter_peer_registered = true;
+    if (recv_info->rx_ctrl != NULL) {
+        s_last_rssi = recv_info->rx_ctrl->rssi;
+    }
+
     process_kvm_packet(data, len, "ESP-NOW");
 }
 
@@ -345,13 +422,14 @@ static void init_espnow_receiver()
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_channel(KVM_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_espnow_recv));
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_24M);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_12M);
 
-    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, 24M PHY, No AP)", KVM_ESPNOW_CHANNEL);
+    ESP_LOGI(TAG, "Pure ESP-NOW Receiver Ready on Channel %d (Station Mode, 12M PHY, No PS)", KVM_ESPNOW_CHANNEL);
 }
 
 // -------------------------------------------------------------
@@ -388,9 +466,112 @@ static void draw_usb_icon(LovyanGFX &gfx, int x, int y, bool connected)
     gfx.drawString(connected ? "USB" : "NO USB", x + 14, y + 3);
 }
 
-static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked)
+static void draw_heart_icon(LovyanGFX &gfx, int hx, int hy, bool linked, bool is_beat)
 {
-    uint16_t col = linked ? 0x07FF : 0x7BEF; // Neon Cyan : Slate Gray
+    if (!linked) {
+        // Dormant / Disconnected Heart (Gray outline)
+        uint16_t col = 0x4A69; // Dim slate gray
+        gfx.drawPixel(hx + 2, hy + 0, col);
+        gfx.drawPixel(hx + 3, hy + 0, col);
+        gfx.drawPixel(hx + 6, hy + 0, col);
+        gfx.drawPixel(hx + 7, hy + 0, col);
+
+        gfx.drawPixel(hx + 1, hy + 1, col);
+        gfx.drawPixel(hx + 4, hy + 1, col);
+        gfx.drawPixel(hx + 5, hy + 1, col);
+        gfx.drawPixel(hx + 8, hy + 1, col);
+
+        gfx.drawPixel(hx + 0, hy + 2, col);
+        gfx.drawPixel(hx + 9, hy + 2, col);
+
+        gfx.drawPixel(hx + 0, hy + 3, col);
+        gfx.drawPixel(hx + 9, hy + 3, col);
+
+        gfx.drawPixel(hx + 1, hy + 4, col);
+        gfx.drawPixel(hx + 8, hy + 4, col);
+
+        gfx.drawPixel(hx + 2, hy + 5, col);
+        gfx.drawPixel(hx + 7, hy + 5, col);
+
+        gfx.drawPixel(hx + 3, hy + 6, col);
+        gfx.drawPixel(hx + 6, hy + 6, col);
+
+        gfx.drawPixel(hx + 4, hy + 7, col);
+        gfx.drawPixel(hx + 5, hy + 7, col);
+        return;
+    }
+
+    if (is_beat) {
+        // --- Big Beating Heart (Expanded 10x8, vibrant glowing red) ---
+        uint16_t red = 0xF800;       // Bright Red
+        uint16_t highlight = 0xFF9F; // Glossy Pink/White shine
+
+        // Top lobes
+        gfx.drawFastHLine(hx + 1, hy + 0, 3, red);
+        gfx.drawFastHLine(hx + 6, hy + 0, 3, red);
+
+        gfx.drawFastHLine(hx + 0, hy + 1, 5, red);
+        gfx.drawFastHLine(hx + 5, hy + 1, 5, red);
+
+        // Body
+        gfx.drawFastHLine(hx + 0, hy + 2, 10, red);
+        gfx.drawFastHLine(hx + 0, hy + 3, 10, red);
+        gfx.drawFastHLine(hx + 1, hy + 4, 8, red);
+        gfx.drawFastHLine(hx + 2, hy + 5, 6, red);
+        gfx.drawFastHLine(hx + 3, hy + 6, 4, red);
+        gfx.drawFastHLine(hx + 4, hy + 7, 2, red);
+
+        // Glossy highlight pixel on top-left lobe for 3D shine
+        gfx.drawPixel(hx + 2, hy + 1, highlight);
+        gfx.drawPixel(hx + 3, hy + 1, highlight);
+    } else {
+        // --- Small Resting Heart (Centered 8x6, deep crimson) ---
+        uint16_t crimson = 0xC800; // Deep Crimson Red
+
+        // Clear margin pixels so beat->rest shrink is sharp
+        gfx.drawFastHLine(hx + 0, hy + 0, 10, 0x10A2);
+        gfx.drawPixel(hx + 0, hy + 1, 0x10A2);
+        gfx.drawPixel(hx + 9, hy + 1, 0x10A2);
+        gfx.drawPixel(hx + 0, hy + 2, 0x10A2);
+        gfx.drawPixel(hx + 9, hy + 2, 0x10A2);
+        gfx.drawPixel(hx + 0, hy + 3, 0x10A2);
+        gfx.drawPixel(hx + 9, hy + 3, 0x10A2);
+        gfx.drawFastHLine(hx + 0, hy + 7, 10, 0x10A2);
+
+        // Top lobes
+        gfx.drawFastHLine(hx + 2, hy + 1, 2, crimson);
+        gfx.drawFastHLine(hx + 6, hy + 1, 2, crimson);
+
+        // Body
+        gfx.drawFastHLine(hx + 1, hy + 2, 8, crimson);
+        gfx.drawFastHLine(hx + 1, hy + 3, 8, crimson);
+        gfx.drawFastHLine(hx + 2, hy + 4, 6, crimson);
+        gfx.drawFastHLine(hx + 3, hy + 5, 4, crimson);
+        gfx.drawFastHLine(hx + 4, hy + 6, 2, crimson);
+    }
+}
+
+static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked, bool is_beat, uint8_t host_status)
+{
+    uint16_t col = 0x7BEF; // Default Slate Gray (scanning)
+    const char *status_text = "RF SCAN";
+    bool animate_heart = false;
+
+    if (linked) {
+        if (host_status == KVM_HOST_ENGAGED) {
+            col = 0x07E0; // Neon Green
+            status_text = "RF:ENGAGED";
+            animate_heart = is_beat;
+        } else if (host_status == KVM_HOST_CONNECTED) {
+            col = 0x07FF; // Neon Cyan
+            status_text = "RF:READY";
+            animate_heart = is_beat;
+        } else {
+            col = 0xFD20; // Amber / Orange
+            status_text = "RF:STANDBY";
+            animate_heart = false; // Heart resting in standby
+        }
+    }
 
     // Central antenna mast
     gfx.drawFastVLine(x + 6, y + 6, 6, col);
@@ -403,16 +584,21 @@ static void draw_rf_icon(LovyanGFX &gfx, int x, int y, bool linked)
     gfx.drawPixel(x + 8, y + 2, col);
     gfx.drawPixel(x + 9, y + 3, col);
 
-    // Outer radiating waves
-    gfx.drawPixel(x + 0, y + 3, col);
-    gfx.drawPixel(x + 1, y + 1, col);
-    gfx.drawFastHLine(x + 3, y - 1, 7, col);
-    gfx.drawPixel(x + 11, y + 1, col);
-    gfx.drawPixel(x + 12, y + 3, col);
+    // Outer radiating waves (glows bright when pulsing)
+    uint16_t outer_col = (linked && animate_heart) ? 0xFFFF : col;
+    gfx.drawPixel(x + 0, y + 3, outer_col);
+    gfx.drawPixel(x + 1, y + 1, outer_col);
+    gfx.drawFastHLine(x + 3, y - 1, 7, outer_col);
+    gfx.drawPixel(x + 11, y + 1, outer_col);
+    gfx.drawPixel(x + 12, y + 3, outer_col);
 
     // Text label
     gfx.setTextColor(col, 0x10A2);
-    gfx.drawString(linked ? "RF LINK" : "RF SCAN", x + 16, y + 3);
+    gfx.drawString(status_text, x + 16, y + 3);
+
+    int text_w = gfx.textWidth(status_text);
+    // Beating Heart (placed right after status text)
+    draw_heart_icon(gfx, x + 16 + text_w + 3, y + 2, linked, animate_heart);
 }
 
 static void draw_battery_icon(LovyanGFX &gfx, int x, int y, int batt_level)
@@ -590,6 +776,23 @@ static void update_display(bool force)
     int current_batt = M5.Power.getBatteryLevel();
     bool is_rf_alive = (now - last_remote_packet_time < 5000) && remote_linked;
 
+    // Beating Heart state:
+    // 1. Direct packet pulse: If any packet arrived in the last 150ms, heart actively pumps
+    // 2. Periodic rhythm: While RF is alive, beat in a rhythmic "lub-dub" cycle (1000ms period)
+    bool is_heart_beating = false;
+    if (is_rf_alive) {
+        uint32_t since_pkt = now - last_remote_packet_time;
+        if (since_pkt < 150) {
+            is_heart_beating = true;
+        } else {
+            uint32_t cycle = now % 1000;
+            // Lub-dub rhythm: pulse 1 (0..120ms), pulse 2 (200..320ms)
+            if (cycle < 120 || (cycle >= 200 && cycle < 320)) {
+                is_heart_beating = true;
+            }
+        }
+    }
+
     bool kbd_active = (now - last_kbd_event_time < 220);
     bool mouse_moving = (now - last_mouse_move_time < 220);
     bool left_clicked = (live_display_mouse_buttons & 0x01) ||
@@ -617,8 +820,8 @@ static void update_display(bool force)
     // USB Icon (x: 6, y: 4)
     draw_usb_icon(gfx, 6, 4, current_mounted);
 
-    // RF Icon (x: 76, y: 4)
-    draw_rf_icon(gfx, 76, 4, is_rf_alive);
+    // RF Icon with Beating Heart (x: 76, y: 4)
+    draw_rf_icon(gfx, 76, 4, is_rf_alive, is_heart_beating, s_last_host_status);
 
     // Battery Icon (x: 204, y: 5)
     draw_battery_icon(gfx, 204, 5, current_batt);
@@ -638,7 +841,7 @@ static void update_display(bool force)
     gfx.drawFastHLine(0, 117, 240, 0x2125);
 
     char pkt_str[32];
-    snprintf(pkt_str, sizeof(pkt_str), "PKTS: %lu", (unsigned long)(key_count + total_mouse_packets));
+    snprintf(pkt_str, sizeof(pkt_str), "PKTS: %lu", (unsigned long)(total_rx_packets + key_count));
     gfx.setTextColor(0x07FF, TFT_BLACK);
     gfx.drawString(pkt_str, 6, 122);
 
@@ -691,6 +894,9 @@ extern "C" void app_main(void)
     // 5. Initialize Pure ESP-NOW Receiver
     init_espnow_receiver();
 
+    // Start Telemetry Task
+    xTaskCreatePinnedToCore(telemetry_task, "kvm_telem", 3072, NULL, 4, &s_telemetry_task_handle, 0);
+
     // 6. Hook Local Keyboard Event Callback
     keyboard.onKeyEvent.connect([](const Keyboard::KeyEvent_t& keyEvent) {
         if (!tusb_hid_device_helper_is_mounted()) {
@@ -742,14 +948,16 @@ extern "C" void app_main(void)
             update_display(true);
         }
 
-        // Dynamic adaptive UI refresh (25Hz during motion/input, 5Hz when idle)
+        // Dynamic adaptive UI refresh (20-25Hz during motion/input/RF sync, 5Hz when idle)
         static uint32_t last_ui_tick = 0;
         uint32_t now = esp_log_timestamp();
+        bool is_rf_active = (now - last_remote_packet_time < 5000) && remote_linked;
         bool is_animating = (now - last_kbd_event_time < 250) ||
                             (now - last_mouse_move_time < 250) ||
                             (now - last_mouse_click_time < 250) ||
-                            (now - last_mouse_wheel_time < 250);
-        uint32_t interval = is_animating ? 40 : 200;
+                            (now - last_mouse_wheel_time < 250) ||
+                            is_rf_active;
+        uint32_t interval = is_animating ? 50 : 200;
 
         if (now - last_ui_tick >= interval) {
             last_ui_tick = now;

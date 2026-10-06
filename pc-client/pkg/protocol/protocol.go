@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // Protocol constants matching kvm_protocol.h
@@ -11,6 +12,8 @@ const (
 	PktTypeKeyReport = uint8(0x01)
 	PktTypeMouseMove = uint8(0x02)
 	PktTypeHeartbeat = uint8(0x03)
+	PktTypePingReq   = uint8(0x04)
+	PktTypePingResp  = uint8(0x05)
 )
 
 // Keyboard Modifiers (Standard USB HID)
@@ -207,6 +210,58 @@ func EncodeHeartbeat(uptimeMs uint32, seq uint16) []byte {
 	binary.LittleEndian.PutUint32(buf[3:7], uptimeMs)
 	binary.LittleEndian.PutUint16(buf[7:9], seq)
 	return buf
+}
+
+// PingReqPacket represents the 5-byte ping request packet (PC Client -> Transmitter)
+type PingReqPacket struct {
+	Magic   uint16 // 0x4B56
+	PktType uint8  // 0x04
+	SeqNum  uint16
+}
+
+// PingRespPacket represents the 27-byte identity response packet (Transmitter -> PC Client)
+type PingRespPacket struct {
+	Magic    uint16
+	PktType  uint8
+	MAC      [6]byte
+	DeviceID string
+	SeqNum   uint16
+}
+
+// EncodePingReq serializes a 5-byte ping request packet
+func EncodePingReq(seq uint16) []byte {
+	buf := make([]byte, 5)
+	binary.LittleEndian.PutUint16(buf[0:2], Magic)
+	buf[2] = PktTypePingReq
+	binary.LittleEndian.PutUint16(buf[3:5], seq)
+	return buf
+}
+
+// ParsePingResp attempts to decode a 27-byte ping response packet from raw bytes
+func ParsePingResp(buf []byte) (*PingRespPacket, error) {
+	if len(buf) < 27 {
+		return nil, fmt.Errorf("buffer too short for ping response: got %d bytes, want 27", len(buf))
+	}
+	magic := binary.LittleEndian.Uint16(buf[0:2])
+	if magic != Magic {
+		return nil, fmt.Errorf("invalid magic: 0x%04X", magic)
+	}
+	if buf[2] != PktTypePingResp {
+		return nil, fmt.Errorf("invalid packet type: 0x%02X", buf[2])
+	}
+	var resp PingRespPacket
+	resp.Magic = magic
+	resp.PktType = buf[2]
+	copy(resp.MAC[:], buf[3:9])
+
+	devIDBytes := buf[9:25]
+	nullIdx := 0
+	for nullIdx < len(devIDBytes) && devIDBytes[nullIdx] != 0 {
+		nullIdx++
+	}
+	resp.DeviceID = string(devIDBytes[:nullIdx])
+	resp.SeqNum = binary.LittleEndian.Uint16(buf[25:27])
+	return &resp, nil
 }
 
 // CharToHID converts an ASCII character to a HID keycode and shift modifier

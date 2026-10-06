@@ -246,6 +246,8 @@ static void serial_bridge_task(void *pvParameters)
                         pkt_size = sizeof(kvm_mouse_packet_t);
                     } else if (pkt_type == KVM_PKT_HEARTBEAT) {
                         pkt_size = sizeof(kvm_heartbeat_packet_t);
+                    } else if (pkt_type == KVM_PKT_PING_REQ) {
+                        pkt_size = sizeof(kvm_ping_req_packet_t);
                     } else {
                         // Unknown packet type under valid magic, advance 1 byte to realign
                         rx_len--;
@@ -258,8 +260,19 @@ static void serial_bridge_task(void *pvParameters)
                         break;
                     }
 
-                    // Beam packet immediately over ESP-NOW!
-                    if (pkt_type == KVM_PKT_KEY_REPORT) {
+                    // Process packet
+                    if (pkt_type == KVM_PKT_PING_REQ) {
+                        kvm_ping_resp_packet_t resp;
+                        memset(&resp, 0, sizeof(resp));
+                        resp.magic = KVM_ESPNOW_MAGIC;
+                        resp.pkt_type = KVM_PKT_PING_RESP;
+                        esp_wifi_get_mac(WIFI_IF_STA, resp.mac);
+                        strncpy(resp.device_id, "KVM_TRANSMITTER", sizeof(resp.device_id) - 1);
+                        resp.seq_num = packet_seq++;
+
+                        uart_write_bytes(UART_PORT, &resp, sizeof(resp));
+                        ESP_LOGI(TAG, "Identity ping request received, sent 'KVM_TRANSMITTER' response");
+                    } else if (pkt_type == KVM_PKT_KEY_REPORT) {
                         // Redundant triple-burst to guarantee 99.999% over-the-air packet reception
                         for (int r = 0; r < 3; r++) {
                             send_raw_packet(rx_buf, pkt_size);

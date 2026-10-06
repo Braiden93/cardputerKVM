@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type Transport interface {
 	SendStringFast(text string, cancel <-chan struct{}, onProgress func(done, total int)) error
 	Close() error
 	IsConnected() bool
+	VerifyHandshake() (bool, string)
 	Stats() TransportStats
 	Endpoint() string
 	Type() string
@@ -51,7 +53,58 @@ type SerialTransport struct {
 	connected bool
 }
 
-// AutoDetectSerialPort scans for connected USB-to-UART or USB CDC devices
+// VerifyTransmitterHandshake opens a serial port, sends KVM_PKT_PING_REQ, and checks for "KVM_TRANSMITTER" response
+func VerifyTransmitterHandshake(portName string, baudRate int) (bool, string, error) {
+	mode := &serial.Mode{
+		BaudRate: baudRate,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+
+	p, err := serial.Open(portName, mode)
+	if err != nil {
+		return false, "", err
+	}
+	defer p.Close()
+
+	_ = p.SetReadTimeout(30 * time.Millisecond)
+
+	req := protocol.EncodePingReq(1)
+	if _, err := p.Write(req); err != nil {
+		return false, "", err
+	}
+
+	buf := make([]byte, 64)
+	readBytes := 0
+	deadline := time.Now().Add(60 * time.Millisecond)
+
+	for readBytes < 27 && time.Now().Before(deadline) {
+		n, err := p.Read(buf[readBytes:])
+		if err != nil {
+			break
+		}
+		readBytes += n
+	}
+
+	if readBytes < 27 {
+		return false, "", fmt.Errorf("no response from %s", portName)
+	}
+
+	for i := 0; i <= readBytes-27; i++ {
+		magic := binary.LittleEndian.Uint16(buf[i : i+2])
+		if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
+			parsed, err := protocol.ParsePingResp(buf[i : i+27])
+			if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
+				return true, parsed.DeviceID, nil
+			}
+		}
+	}
+
+	return false, "", fmt.Errorf("device on %s is not a Cardputer-KVM transmitter", portName)
+}
+
+// AutoDetectSerialPort scans for connected USB-to-UART or USB CDC devices and verifies hardware identity
 func AutoDetectSerialPort() (string, error) {
 	ports, err := serial.GetPortsList()
 	if err != nil {
@@ -62,21 +115,28 @@ func AutoDetectSerialPort() (string, error) {
 		return "", fmt.Errorf("no serial devices found. Plug in the ESP32-S3 transmitter via USB")
 	}
 
-	// 1. Prefer /dev/ttyUSB* (CH340 / CP2102)
+	// 1. Scan for a verified Cardputer-KVM transmitter dongle with response
+	for _, p := range ports {
+		if verified, _, _ := VerifyTransmitterHandshake(p, 921600); verified {
+			return p, nil
+		}
+	}
+
+	// 2. Fallback: Prefer /dev/ttyUSB* (CH340 / CP2102)
 	for _, p := range ports {
 		if strings.Contains(p, "ttyUSB") {
 			return p, nil
 		}
 	}
 
-	// 2. Prefer /dev/ttyACM* (Native ESP32-S3 USB CDC)
+	// 3. Fallback: Prefer /dev/ttyACM* (Native ESP32-S3 USB CDC)
 	for _, p := range ports {
 		if strings.Contains(p, "ttyACM") {
 			return p, nil
 		}
 	}
 
-	// 3. Fallback to first port
+	// 4. Fallback to first port
 	return ports[0], nil
 }
 
@@ -122,6 +182,7 @@ func (s *SerialTransport) Send(data []byte) error {
 	n, err := s.port.Write(data)
 	if err != nil {
 		s.stats.Errors++
+		s.connected = false
 		return err
 	}
 
@@ -180,6 +241,7 @@ func (s *SerialTransport) SendMouse(buttons byte, dx, dy, wheel int8) error {
 	n, err := s.port.Write(pkt)
 	if err != nil {
 		s.stats.Errors++
+		s.connected = false
 		return err
 	}
 	s.stats.PacketsSent++
@@ -281,7 +343,9 @@ func (s *SerialTransport) Close() error {
 	defer s.mu.Unlock()
 	s.connected = false
 	if s.port != nil {
-		return s.port.Close()
+		err := s.port.Close()
+		s.port = nil
+		return err
 	}
 	return nil
 }
@@ -290,6 +354,56 @@ func (s *SerialTransport) IsConnected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.connected
+}
+
+// VerifyHandshake sends a ping request over the open serial transport to verify transmitter identity
+func (s *SerialTransport) VerifyHandshake() (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.port == nil || !s.connected {
+		return false, ""
+	}
+
+	_ = s.port.SetReadTimeout(30 * time.Millisecond)
+
+	s.seq++
+	req := protocol.EncodePingReq(s.seq)
+	if _, err := s.port.Write(req); err != nil {
+		s.connected = false
+		return false, ""
+	}
+
+	buf := make([]byte, 64)
+	readBytes := 0
+	deadline := time.Now().Add(60 * time.Millisecond)
+
+	for readBytes < 27 && time.Now().Before(deadline) {
+		n, err := s.port.Read(buf[readBytes:])
+		if err != nil {
+			s.connected = false
+			return false, ""
+		}
+		readBytes += n
+	}
+
+	if readBytes < 27 {
+		s.connected = false
+		return false, ""
+	}
+
+	for i := 0; i <= readBytes-27; i++ {
+		magic := binary.LittleEndian.Uint16(buf[i : i+2])
+		if magic == protocol.Magic && buf[i+2] == protocol.PktTypePingResp {
+			parsed, err := protocol.ParsePingResp(buf[i : i+27])
+			if err == nil && parsed.DeviceID == "KVM_TRANSMITTER" {
+				return true, parsed.DeviceID
+			}
+		}
+	}
+
+	s.connected = false
+	return false, ""
 }
 
 func (s *SerialTransport) Stats() TransportStats {

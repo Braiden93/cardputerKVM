@@ -9,6 +9,8 @@ typedef enum {
     KVM_PKT_KEY_REPORT  = 0x01, // Keyboard press / release report
     KVM_PKT_MOUSE_MOVE  = 0x02, // Mouse move / click report
     KVM_PKT_HEARTBEAT   = 0x03, // Connection check / ping
+    KVM_PKT_PING_REQ    = 0x04, // Handshake ping request from PC Client
+    KVM_PKT_PING_RESP   = 0x05, // Identity ping response from Transmitter
 } kvm_packet_type_t;
 
 // Standard 6KRO USB-compliant Key Packet
@@ -38,3 +40,20 @@ typedef struct __attribute__((packed)) {
     uint32_t uptime_ms;     // Transmitter uptime in ms
     uint16_t seq_num;
 } kvm_heartbeat_packet_t;
+
+// Handshake Ping Request Packet (PC Client -> Transmitter)
+typedef struct __attribute__((packed)) {
+    uint16_t magic;         // KVM_ESPNOW_MAGIC (0x4B56)
+    uint8_t  pkt_type;      // KVM_PKT_PING_REQ (0x04)
+    uint16_t seq_num;       // Sequence number
+} kvm_ping_req_packet_t;
+
+// Identity Response Packet (Transmitter -> PC Client)
+typedef struct __attribute__((packed)) {
+    uint16_t magic;         // KVM_ESPNOW_MAGIC (0x4B56)
+    uint8_t  pkt_type;      // KVM_PKT_PING_RESP (0x05)
+    uint8_t  mac[6];        // Transmitter Wi-Fi STA MAC
+    char     device_id[16]; // "KVM_TRANSMITTER" (null-terminated)
+    uint16_t seq_num;
+} kvm_ping_resp_packet_t;
+

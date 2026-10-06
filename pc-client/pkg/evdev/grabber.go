@@ -238,6 +238,19 @@ func NewGrabber(trans transport.Transport, onEvent func(GrabEvent)) (*Grabber, e
 	return g, nil
 }
 
+// SetTransport dynamically updates the active transport instance
+func (g *Grabber) SetTransport(trans transport.Transport) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.trans = trans
+}
+
+func (g *Grabber) getTransport() transport.Transport {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.trans
+}
+
 // Start begins event listening loops on all devices
 func (g *Grabber) Start() {
 	for _, dev := range g.devices {
@@ -286,8 +299,10 @@ func (g *Grabber) SetGrab(grab bool) error {
 	if !grab {
 		// When releasing grab back to local host:
 		// Send release packets to remote host so no keys remain stuck
-		_ = g.trans.SendRelease()
-		_ = g.trans.SendMouse(0, 0, 0, 0)
+		if t := g.getTransport(); t != nil {
+			_ = t.SendRelease()
+			_ = t.SendMouse(0, 0, 0, 0)
+		}
 		g.activeModifiers = 0
 		g.activeKeys = nil
 		g.activeMouseButtons = 0
@@ -442,7 +457,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnLeft
 		}
-		_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if t := g.getTransport(); t != nil {
+			_ = t.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		}
 		g.emitMouseEvent(0, 0, 0)
 		return
 
@@ -452,7 +469,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnRight
 		}
-		_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if t := g.getTransport(); t != nil {
+			_ = t.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		}
 		g.emitMouseEvent(0, 0, 0)
 		return
 
@@ -462,7 +481,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 		} else if evt.Value == 0 {
 			g.activeMouseButtons &= ^protocol.MouseBtnMiddle
 		}
-		_ = g.trans.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		if t := g.getTransport(); t != nil {
+			_ = t.SendMouse(g.activeMouseButtons, 0, 0, 0)
+		}
 		g.emitMouseEvent(0, 0, 0)
 		return
 	}
@@ -522,7 +543,9 @@ func (g *Grabber) handleKeyEvent(evt InputEvent) {
 func (g *Grabber) sendReportLocked() {
 	var keys [6]byte
 	copy(keys[:], g.activeKeys)
-	_ = g.trans.SendReport(g.activeModifiers, keys)
+	if t := g.getTransport(); t != nil {
+		_ = t.SendReport(g.activeModifiers, keys)
+	}
 }
 
 // emitKeyEvent dispatches key telemetry to the UI callback
@@ -603,8 +626,11 @@ func (g *Grabber) handleSynEvent() {
 	g.mouseWheel = 0
 	g.mouseMu.Unlock()
 
+	t := g.getTransport()
 	for i := 0; i < count; i++ {
-		_ = g.trans.SendMouse(buttons, reports[i][0], reports[i][1], reports[i][2])
+		if t != nil {
+			_ = t.SendMouse(buttons, reports[i][0], reports[i][1], reports[i][2])
+		}
 		g.emitMouseEvent(reports[i][0], reports[i][1], reports[i][2])
 	}
 }
@@ -654,8 +680,10 @@ func (g *Grabber) Close() error {
 			_ = dev.file.Close()
 		}
 
-		_ = g.trans.SendRelease()
-		_ = g.trans.SendMouse(0, 0, 0, 0)
+		if t := g.getTransport(); t != nil {
+			_ = t.SendRelease()
+			_ = t.SendMouse(0, 0, 0, 0)
+		}
 	})
 	return nil
 }
@@ -689,6 +717,12 @@ func (g *Grabber) PasteHostClipboard() {
 		g.pasteMu.Unlock()
 	}()
 
+	t := g.getTransport()
+	if t == nil {
+		g.emitLog("Paste failed: transport not connected")
+		return
+	}
+
 	text, err := ReadHostClipboard()
 	if err != nil {
 		g.emitLog(fmt.Sprintf("❌ Clipboard error: %v", err))
@@ -706,14 +740,14 @@ func (g *Grabber) PasteHostClipboard() {
 	g.mu.Lock()
 	g.activeKeys = nil
 	g.activeModifiers = 0
-	_ = g.trans.SendRelease()
+	_ = t.SendRelease()
 	g.mu.Unlock()
 	time.Sleep(10 * time.Millisecond)
 
 	g.emitLog(fmt.Sprintf("⚡ High-speed pasting %d chars (~125 chars/sec)... [Esc to cancel]", total))
 
 	lastPct := -1
-	err = g.trans.SendStringFast(text, cancel, func(done, total int) {
+	err = t.SendStringFast(text, cancel, func(done, total int) {
 		pct := (done * 100) / total
 		if pct/25 != lastPct/25 {
 			lastPct = pct

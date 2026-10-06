@@ -5,16 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/evdev"
+	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/gui"
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/protocol"
 	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/transport"
-	"github.com/ThunderStorm/Cardputer-KVM/pc-client/pkg/ui"
 )
 
 func main() {
@@ -23,7 +20,7 @@ func main() {
 	baudRate := flag.Int("baud", 921600, "Serial baud rate (default 921600 for 1000Hz polling)")
 	startGrabbed := flag.Bool("grab", false, "Start immediately in hardware grab mode (locks physical input to target PC)")
 
-	injectText := flag.String("text", "", "CLI one-shot: inject text string to target PC without TUI")
+	injectText := flag.String("text", "", "CLI one-shot: inject text string to target PC without GUI")
 	injectMacro := flag.String("macro", "", "CLI one-shot: execute macro ('cad' for Ctrl+Alt+Del, 'lock' for Win+L, etc.)")
 	pasteClipboard := flag.Bool("paste", false, "CLI one-shot: paste host clipboard to target PC at high speed (~125 chars/sec)")
 	charDelayMs := flag.Int("delay", 15, "Delay between keystrokes in ms (for text injection)")
@@ -88,16 +85,11 @@ func main() {
 	}
 
 	// 3. Hardware KVM Grabber Mode
-	var (
-		p      *tea.Program
-		progMu sync.Mutex
-	)
+	var guiApp *gui.GUIApp
 
 	grabber, err := evdev.NewGrabber(trans, func(evt evdev.GrabEvent) {
-		progMu.Lock()
-		defer progMu.Unlock()
-		if p != nil {
-			p.Send(ui.GrabMsg(evt))
+		if guiApp != nil {
+			guiApp.HandleGrabEvent(evt)
 		}
 	})
 	if err != nil {
@@ -120,22 +112,10 @@ func main() {
 	go func() {
 		<-sigChan
 		_ = grabber.Close()
-		progMu.Lock()
-		if p != nil {
-			p.Quit()
-		}
-		progMu.Unlock()
 		os.Exit(0)
 	}()
 
-	// 4. Run Interactive Bubbletea Hardware KVM HUD
-	m := ui.NewModel(trans, grabber)
-	progMu.Lock()
-	p = tea.NewProgram(m, tea.WithAltScreen())
-	progMu.Unlock()
-
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
-		os.Exit(1)
-	}
+	// 4. Run Native Desktop GUI Control Center (Fyne v2)
+	guiApp = gui.NewGUIApp(trans, grabber)
+	guiApp.Run()
 }

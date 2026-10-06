@@ -1,24 +1,24 @@
 # Cardputer-KVM — System Architecture & Overview
 
 ## 1. Project Concept
-**Cardputer-KVM** is a modular, wireless/remote KVM (Keyboard-Video-Mouse / Controller) solution where the **M5Stack Cardputer-ADV** serves as the **primary KVM Receiver and Host Interface**, receiving remote input from wireless transmitters, mobile apps, and desktop clients while maintaining local console control.
+**Cardputer-KVM** is a modular, ultra-low-latency wireless KVM (Keyboard-Mouse) ecosystem where the **M5Stack Cardputer-ADV** serves as the **primary KVM Receiver and Host Interface**, receiving remote input from wireless transmitters, mobile apps, and desktop clients while maintaining local console control and live bidirectional telemetry.
 
 ```mermaid
 graph TD
     subgraph Control Workstation
-        P[PC Client: cardputer-kvm] -->|USB Serial Cable: /dev/ttyUSB0| T[Transmitter: ESP32-S3 Dongle]
+        P["PC Client: cardputer-kvm (Go + Fyne GUI)"] -->|"UART0 Serial (921,600 baud)"| T["Transmitter: ESP32-S3 Dongle"]
     end
 
     subgraph Mobile Controller
-        A[Android Client: Mobile App] -.->|Wi-Fi / UDP| R
+        A["Android Client: Mobile App"] -.->|"Wi-Fi / UDP"| R
     end
 
     subgraph RF Wireless Link
-        T -->|ESP-NOW / 2.4 GHz RF Channel 1| R[Receiver: M5Stack Cardputer-ADV]
+        T <-->|"ESP-NOW Duplex RF / Channel 1 (1-2ms RTT)"| R["Receiver: M5Stack Cardputer-ADV"]
     end
 
     subgraph Target Host Machine
-        R -->|Native USB-C OTG / Dell HID Spoof| PC[Target Host Machine / PC]
+        R -->|"Native USB-C OTG / Dell KM636 Spoof"| PC["Target Host Machine / PC / Phone"]
     end
 ```
 
@@ -28,10 +28,10 @@ graph TD
 
 | Directory | Target Hardware / Platform | Role & Primary Responsibilities |
 | :--- | :--- | :--- |
-| **`receiver/`** | **M5Stack Cardputer-ADV** | **Primary Smart KVM Receiver:** Plugs directly into the target host via USB-C. Uses ESP32-S3 native USB OTG to emulate a **Dell KB216 Wired Keyboard + Mouse** (`0x413C:0x2113`). Features a 1.14" ST7789 display for live connection status, battery, and input telemetry, plus local keyboard override. |
-| **`transmitter/`** | **ESP32-S3** (N16R8 / Custom) | **Handheld Wireless Transmitter / USB Dongle:** Connects to PC via USB cable (UART bridge). Relays keyboard and mouse packets from the PC client to the Cardputer receiver over **ESP-NOW**. Also functions standalone with onboard buttons. |
-| **`pc-client/`** | Desktop OS (Linux / Windows / macOS) | **PC Remote Console (Go TUI):** High-performance Bubbletea TUI application. Communicates directly with the ESP32-S3 transmitter dongle via USB serial to beam raw keystrokes, virtual mouse movements, macros, and scripts. |
-| **`android-client/`** | Android Mobile OS | **Mobile Remote Controller:** Touchpad, virtual keyboard, and remote control over Wi-Fi/BLE. |
+| **`receiver/`** | **M5Stack Cardputer-ADV** | **Primary Smart KVM Receiver:** Plugs directly into the target host via USB-C. Uses ESP32-S3 native USB OTG to emulate a **Dell Wireless Keyboard & Mouse Combo** (`0x413C:0x2501`). Features a 1.14" ST7789 display for live USB status (with suspend detection), RF link state (`STANDBY`/`READY`/`ENGAGED`), battery gauge, and input telemetry. Measures and transmits live battery %, mV, and RSSI back to the transmitter. |
+| **`transmitter/`** | **ESP32-S3** (N16R8 / Custom) | **Wireless Transmitter / USB Dongle:** Connects to PC via USB at 921,600 baud. Beams 6KRO keyboard and 125Hz mouse packets over **ESP-NOW**. Features intelligent heartbeat arbitration (idle standby beacon vs PC app active) and bidirectional UART forwarding of receiver telemetry. |
+| **`pc-client/`** | Linux Desktop | **Hardware KVM Switch Desktop App (Go + Fyne):** Native GUI application with Linux kernel `evdev` grabbing (`Scroll Lock` hotkey), Scroll Lock LED sync, Light/Dark mode, live Cardputer battery donut gauge, animated RF heartbeat pulse dot, and true end-to-end RTT latency tracking. |
+| **`android-client/`** | Android Mobile OS | **Mobile Remote Controller:** Touchpad, virtual keyboard, and remote control over Wi-Fi/BLE. *(In development)* |
 | **`esp-sdk/`** | Local ESP-IDF Framework | **Toolchain & Core Framework:** Local ESP-IDF v5.3 repository used to build all embedded targets. |
 
 ---
@@ -39,9 +39,9 @@ graph TD
 ## 3. Communication Strategy
 
 ### Primary Link: `PC Client` ↔ `Transmitter (ESP32-S3)` ↔ `Receiver (Cardputer-ADV)`
-* **Workstation to Transmitter:** USB Serial Cable (`/dev/ttyUSB0` or `/dev/ttyACM0` at 115200 baud). High-speed binary packet framing with auto-port detection.
-* **Transmitter to Receiver:** ESP-NOW 2.4 GHz Peer-to-Peer RF (Channel 1, broadcast pairing). Near-zero latency (~2–5 ms), router-free.
-* **Receiver to Target Host:** Native USB OTG emulating Dell KB216 Keyboard and Mouse.
+* **Workstation to Transmitter:** High-speed USB Serial UART0 at **921,600 baud**. Binary packet framing with automatic port detection and non-blocking background read loops.
+* **Transmitter to Receiver:** ESP-NOW 2.4 GHz Peer-to-Peer RF (Channel 1, 12M PHY). Near-zero latency (~1–2 ms RTT), router-free, with bidirectional packet echo for live latency calculation.
+* **Receiver to Target Host:** Native USB OTG emulating a Dell Wireless KM636 Keyboard and Mouse (1000Hz polling).
 * **Secondary / Network Link:** Wi-Fi SoftAP / UDP sockets available for `android-client`.
 
 ---
@@ -52,8 +52,8 @@ graph TD
 * **Role:** Smart KVM Receiver, Host USB Injector & On-Desk Status Console.
 * **Core:** ESP32-S3FN8 (dual-core 240MHz, 8MB Flash).
 * **Native USB Advantage:** USB-C connector is wired **directly to GPIO 19 (D-) and GPIO 20 (D+)**, giving pure USB OTG functionality without intervening bridge chips.
-* **USB Identity:** Spoofs a **Dell KB216 Wired Keyboard** (VID: `0x413C`, PID: `0x2113`).
-* **Display:** 1.14" ST7789 TFT LCD (240x135 SPI) displaying connection state, battery %, and live input logs.
+* **USB Identity:** Spoofs a **Dell Wireless Keyboard and Mouse Receiver** (VID: `0x413C`, PID: `0x2501` KM636 / KM714 Wireless Combo).
+* **Display:** 1.14" ST7789 TFT LCD (240x135 SPI) displaying live USB connection state (`USB` vs `NO USB`), RF link status (`RF:STANDBY`, `RF:READY`, `RF:ENGAGED`), animated beating heart indicator, battery gauge, and key/mouse telemetry cards.
 * **Keyboard:** 56-key matrix scanned by an onboard **TCA8418 I²C controller** (`0x34`, INT on GPIO 11), providing a local physical keyboard override at the host machine.
 * **Framework:** M5Stack official HAL (`M5Unified`, `M5GFX`, `Adafruit_TCA8418`, `tusb_hid_device_helper`).
 
